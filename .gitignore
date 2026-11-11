@@ -14,3 +14,4 @@ tools/__pycache__/
 
 # 本地参考文件（不属于 MIT 授权范围，见 README）
 /参考/
+dist2/
