@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="paper">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https: http:;">
+  <title>Novie · 本地码字工坊</title>
+  <link rel="stylesheet" href="css/app.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%238a5a3b'/%3E%3Ctext x='32' y='44' font-family='Georgia,serif' font-size='36' fill='%23fbf6ec' text-anchor='middle'%3EN%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <div id="app" class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-mark">N</div>
+        <div class="brand-text">
+          <strong>Novie</strong>
+          <span>本地码字工坊</span>
+        </div>
+        <div class="brand-actions">
+          <button class="icon-btn" id="btn-theme-picker" type="button" title="选择主题" aria-label="选择主题"></button>
+          <button class="icon-btn" id="btn-theme" type="button" title="切换亮暗模式" aria-label="切换亮暗模式"></button>
+        </div>
+      </div>
+
+      <div class="project-switch-host" id="project-switch"></div>
+
+      <nav class="nav" id="main-nav" aria-label="主功能"></nav>
+
+      <div class="tree-wrap" id="tree-wrap">
+        <div class="tree-head">
+          <span class="tree-title">章节目录</span>
+          <span class="tree-head-actions">
+            <button class="icon-btn small" id="btn-add-volume" type="button" title="新建卷" aria-label="新建卷"></button>
+            <button class="icon-btn small" id="btn-search" type="button" title="全文搜索 (Ctrl+F)" aria-label="全文搜索"></button>
+          </span>
+        </div>
+        <div class="tree-filter-wrap">
+          <input class="input tree-filter" id="chapter-filter" type="search" placeholder="筛选章节标题或摘要…" aria-label="筛选章节">
+        </div>
+        <div class="chapter-tree" id="chapter-tree"></div>
+      </div>
+
+      <div class="sidebar-bottom">
+        <div id="sidebar-goal"></div>
+        <div class="sidebar-links">
+          <button class="text-btn" id="btn-help" type="button">快捷键</button>
+          <span class="sidebar-version">Novie v1.0</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main" id="main">
+      <header class="topbar" id="topbar"></header>
+      <div class="view-host" id="view-host"></div>
+    </main>
+
+    <aside class="inspector" id="inspector"></aside>
+
+    <footer class="statusbar" id="statusbar"></footer>
+  </div>
+
+  <div id="overlay-root"></div>
+  <div id="toast-root" class="toast-root" aria-live="polite"></div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

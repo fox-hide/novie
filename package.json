@@ -1,0 +1,42 @@
+{
+  "name": "novie",
+  "version": "1.0.0",
+  "description": "Novie — 本地优先的网文码字工坊（沉浸写作 / 大纲人设 / 素材统计 / 多格式导出 / 加密备份 / WebDAV）",
+  "main": "electron/main.js",
+  "author": "Novie",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "smoke": "electron . --smoke-test",
+    "serve": "node tools/serve.js",
+    "test": "node --test tests/*.test.mjs",
+    "build": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^45.2.3",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "com.novie.writer",
+    "productName": "Novie",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

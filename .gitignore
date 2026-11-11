@@ -1,0 +1,16 @@
+node_modules/
+dist/
+tmp/
+out/
+*.log
+.DS_Store
+Thumbs.db
+src/_print-test.html
+src/_import_bundle.json
+tools/__pycache__/
+
+# 本地版权文本（z-library 来源，不入库）
+/斗罗大陆*
+
+# 本地参考文件（不属于 MIT 授权范围，见 README）
+/参考/
