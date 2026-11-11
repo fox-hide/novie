@@ -58,7 +58,19 @@ export class Editor {
     this._pendingProgrammatic = false;
     this._restoredFromProgrammatic = false;
 
-    this._onInput = () => {
+    this._onInput = e => {
+      // IME 组词中的字母（如拼音 woshi）尚未上屏，不计数、不触发保存；
+      // 上屏后由 compositionend 统一补算
+      if (e && e.isComposing) return;
+      this._pendingProgrammatic = false;
+      this._restoredFromProgrammatic = false;
+      this.updateEmptyState();
+      this.emitChange();
+      if (this.typewriter) this.scrollCaretToCenter();
+    };
+    this._onCompositionEnd = () => {
+      // 组词提交（空格上屏）后重算，保证按最终汉字计数；若随后浏览器再派发
+      // 一次 isComposing=false 的 input，会再次进入 _onInput，delta 为 0 无副作用
       this._pendingProgrammatic = false;
       this._restoredFromProgrammatic = false;
       this.updateEmptyState();
@@ -117,6 +129,7 @@ export class Editor {
     };
 
     root.addEventListener('input', this._onInput);
+    root.addEventListener('compositionend', this._onCompositionEnd);
     root.addEventListener('paste', this._onPaste);
     root.addEventListener('drop', this._onDrop);
     root.addEventListener('dragover', this._onDragOver);
@@ -127,6 +140,7 @@ export class Editor {
   destroy() {
     this._disposed = true;
     this.root.removeEventListener('input', this._onInput);
+    this.root.removeEventListener('compositionend', this._onCompositionEnd);
     this.root.removeEventListener('paste', this._onPaste);
     this.root.removeEventListener('drop', this._onDrop);
     this.root.removeEventListener('dragover', this._onDragOver);

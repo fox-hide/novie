@@ -1222,7 +1222,14 @@ export class App {
       return;
     }
     const chapter = this.state.activeChapter;
-    const parts = this.state.editor.splitAtCaret();
+    // 拆章是内容搬移：suppress 今日计数，避免后半章被当成“删除”
+    this.state.session.suppressTodayDelta = true;
+    let parts;
+    try {
+      parts = this.state.editor.splitAtCaret();
+    } finally {
+      this.state.session.suppressTodayDelta = false;
+    }
     if (!parts || !parts.after.trim()) {
       toast('光标之后没有内容，无法拆分', 'warn');
       return;
@@ -1379,7 +1386,8 @@ export class App {
   addTodayWords(n) {
     if (!this.state.project) return;
     const record = this.getTodayRecord();
-    record.words += n;
+    // 净变化计数：删除会回落，但今日累计不会低于 0（不会吃掉往日统计）
+    record.words = Math.max(0, record.words + n);
     this.scheduleDailySave();
     const goal = this.state.project.dailyGoal || 0;
     if (goal > 0 && record.words >= goal && this.state.goalHitDate !== record.date) {
@@ -1413,7 +1421,9 @@ export class App {
     if (!this.state.activeChapter) return;
     const session = this.state.session;
     const delta = counts.chars - session.lastCount;
-    if (delta > 0) this.addTodayWords(delta);
+    // 净变化入账：输入为正、删除为负；suppressTodayDelta 用于拆章/排版等
+    // 结构性操作——内容是搬移或格式调整，不该计入今日码字数
+    if (delta !== 0 && !session.suppressTodayDelta) this.addTodayWords(delta);
     session.lastCount = counts.chars;
     session.lastInputAt = Date.now();
     session.editRevision++;
@@ -2085,7 +2095,14 @@ export class App {
       return;
     }
     await this.createSnapshot(this.state.activeChapter.id, { label: '排版前快照', silent: true });
-    const result = this.state.editor.smartTypeset();
+    // 排版是格式调整（可能删掉段首空格），不计入今日码字增减
+    this.state.session.suppressTodayDelta = true;
+    let result;
+    try {
+      result = this.state.editor.smartTypeset();
+    } finally {
+      this.state.session.suppressTodayDelta = false;
+    }
     if (!result.changed && !result.removed) {
       toast('排版检查完成：没有需要修改的地方', 'info', 2200);
       return;
