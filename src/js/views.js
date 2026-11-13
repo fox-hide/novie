@@ -2,10 +2,10 @@
 
 import {
   el, icon, makeButton, makeIconButton, contextMenu, showModal,
-  confirmDialog, emptyState, toast, badge, copyText
+  confirmDialog, emptyState, toast, badge, copyText, setButtonBusy
 } from './ui.js';
 import { makePage, statTile, toolbarRow } from './view-kit.js';
-import { fmtNumber, fmtWan, truncate, uid, parseTags } from './utils.js';
+import { fmtNumber, fmtWan, truncate, uid, parseTags, safeColor } from './utils.js';
 import { put, del } from './db.js';
 import { showChapterInfo } from './sidebar.js';
 import { renderMaterialsView } from './views2.js';
@@ -65,7 +65,7 @@ function renderOutlineView(app) {
 
   const volumesHost = el('div', { class: 'outline-volumes' });
   const paint = () => {
-    const keyword = search.value.trim();
+    const keyword = search.value.trim().toLowerCase();
     volumesHost.innerHTML = '';
     const volumes = [...app.state.volumes].sort((a, b) => a.order - b.order);
     if (!volumes.length) {
@@ -79,7 +79,7 @@ function renderOutlineView(app) {
       const chapters = app.state.chapters
         .filter(c => c.volumeId === volume.id)
         .sort((a, b) => a.order - b.order)
-        .filter(c => !keyword || (c.title + ' ' + (c.summary || '')).includes(keyword));
+        .filter(c => !keyword || `${c.title} ${c.summary || ''}`.toLowerCase().includes(keyword));
       const allChapters = app.state.chapters.filter(c => c.volumeId === volume.id);
       if (keyword && !chapters.length) continue;
       const words = allChapters.reduce((n, c) => n + app.chapterWordCount(c), 0);
@@ -162,7 +162,7 @@ function outlineCard(app, chapter) {
   const plotDots = el('div', { class: 'outline-plot-dots' });
   for (const id of chapter.plotlineIds || []) {
     const line = app.state.plotlines.find(p => p.id === id);
-    if (line) plotDots.appendChild(el('span', { class: 'color-dot', title: line.name, style: { background: line.color || '#b4552d' } }));
+    if (line) plotDots.appendChild(el('span', { class: 'color-dot', title: line.name, style: { background: safeColor(line.color, '#b4552d') } }));
   }
   if (plotDots.children.length) card.appendChild(plotDots);
   card.appendChild(el('div', { class: 'outline-card-foot' }, [
@@ -199,11 +199,20 @@ function renderCharactersView(app) {
 
   const host = el('div');
   body.appendChild(host);
+  // 预建出场计数表，避免卡片渲染时对每个人物都全量扫一遍章节
+  const mentionCount = new Map();
+  for (const ch of app.state.chapters) {
+    for (const id of (ch.mentions || [])) mentionCount.set(id, (mentionCount.get(id) || 0) + 1);
+  }
   const paint = () => {
-    const keyword = search.value.trim();
+    // 重绘前显式停掉旧星图的动画循环与监听，而不是只依赖 isConnected 兜底
+    const oldMap = host.querySelector('.star-map-shell')?.__starMap;
+    if (oldMap) oldMap.stop();
+    const keyword = search.value.trim().toLowerCase();
     host.innerHTML = '';
     const chars = app.state.characters.filter(c =>
-      !keyword || [c.name, c.alias, c.role, c.identity, ...(c.tags || [])].join(' ').includes(keyword)
+      !keyword || [c.name, c.alias, c.role, c.identity, ...(c.tags || [])]
+        .map(v => String(v ?? '')).join(' ').toLowerCase().includes(keyword)
     );
     if (!app.state.characters.length) {
       host.appendChild(emptyState({
@@ -225,12 +234,13 @@ function renderCharactersView(app) {
     }
     const grid = el('div', { class: 'character-grid' });
     for (const c of chars) {
-      const mentioned = app.state.chapters.some(ch => (ch.mentions || []).includes(c.id));
+      const appearances = mentionCount.get(c.id) || 0;
+      const mentioned = appearances > 0;
       const card = el('article', { class: 'character-card' });
       const head = el('div', { class: 'character-head' });
       head.appendChild(el('div', {
         class: 'character-avatar',
-        style: { background: c.color || '#8a5a3b' },
+        style: { background: safeColor(c.color) },
         text: (c.name || '?').slice(0, 1),
       }));
       head.appendChild(el('div', { class: 'character-head-meta' }, [
@@ -247,7 +257,6 @@ function renderCharactersView(app) {
       (c.tags || []).slice(0, 4).forEach(t => tags.appendChild(el('span', { class: 'tag', text: t })));
       card.appendChild(tags);
       const foot = el('div', { class: 'character-foot' });
-      const appearances = app.state.chapters.filter(ch => (ch.mentions || []).includes(c.id)).length;
       foot.appendChild(el('span', { class: 'muted tiny', text: appearances ? `出场 ${appearances} 章` : '尚未关联出场' }));
       const actions = el('div', { class: 'character-actions' });
       actions.appendChild(makeButton('插入姓名', { small: true, ghost: true, onClick: () => app.insertIntoEditor(c.name) }));
@@ -288,7 +297,7 @@ export function openCharacterEditor(app, character) {
   const color = el('input', { class: 'input color-input', type: 'color', value: draft.color || '#8a5a3b' });
 
   const relationsBox = el('div', { class: 'relation-editor' });
-  const relations = (draft.relations || []).map(r => ({ ...r }));
+  const relations = [];
   const addRelationRow = (rel = {}) => {
     const row = el('div', { class: 'relation-row' });
     const select = el('select', { class: 'input' }, [
@@ -306,23 +315,18 @@ export function openCharacterEditor(app, character) {
     const sync = () => { item.targetId = select.value; item.label = label.value.trim(); };
     select.addEventListener('change', sync);
     label.addEventListener('input', sync);
-    const idx = relations.indexOf(rel);
-    if (idx >= 0) relations.splice(idx, 1);
     relations.push(item);
     row.appendChild(select);
     row.appendChild(label);
     row.appendChild(remove);
     relationsBox.appendChild(row);
   };
-  // 清空后按实际内容重建，避免重复
-  relations.length = 0;
   const initialRelations = (draft.relations || []).map(r => ({ ...r }));
-  relationsBox.innerHTML = '';
   initialRelations.forEach(r => addRelationRow(r));
   if (!initialRelations.length) {
-    // 空状态提示
     relationsBox.appendChild(el('p', { class: 'muted tiny relation-empty', text: '还没有关系。可以从下方添加。' }));
   }
+  const relationHint = el('p', { class: 'muted tiny', text: '关系为单向记录：只显示在本人物档案与下拉里；如需双向，请在对方档案中再添加一条。' });
   const addBtn = makeButton('添加关系', {
     small: true, ghost: true, iconName: 'plus',
     onClick: () => {
@@ -355,10 +359,12 @@ export function openCharacterEditor(app, character) {
     onClick: async () => {
       if (isNew) { toast('先保存人物，再扫描出场', 'info'); return; }
       await app.saveCurrent('scan');
+      // 只读扫描：不直接改库（点"取消"不会留下不可回滚的章节数据）；
+      // 点"保存"时才按表单里最终的姓名统一写回 mentions
       const obj = { ...draft, name: name.value.trim(), alias: alias.value.trim() };
-      const found = await app.scanCharacterAppearances(obj);
+      const found = await app.scanCharacterAppearances(obj, { write: false });
       renderAppearances(found.sort((a, b) => a.order - b.order));
-      toast(`扫描完成：共 ${found.length} 章出场`, 'success');
+      toast(`扫描完成：共 ${found.length} 章出场，保存档案后生效`, 'success');
     },
   });
 
@@ -385,6 +391,7 @@ export function openCharacterEditor(app, character) {
         addBtn,
       ]),
       relationsBox,
+      relationHint,
     ]),
     el('div', { class: 'editor-section' }, [
       el('div', { class: 'editor-section-head' }, [
@@ -434,9 +441,11 @@ export function openCharacterEditor(app, character) {
       { label: '取消', ghost: true },
       {
         label: '保存', primary: true,
-        onClick: async () => {
+        onClick: async ({ btn }) => {
           const n = name.value.trim();
           if (!n) { name.focus(); name.classList.add('shake'); setTimeout(() => name.classList.remove('shake'), 400); return false; }
+          setButtonBusy(btn, true, '保存中…');
+          try {
           const obj = {
             ...draft,
             id: draft.id,
@@ -458,11 +467,16 @@ export function openCharacterEditor(app, character) {
           await put('characters', obj);
           if (isNew) app.state.characters.push(obj);
           else app.state.characters = app.state.characters.map(c => c.id === obj.id ? obj : c);
+          // 保存后按最终姓名/别名统一回写出场记录（扫描按钮本身只读预览）
+          await app.scanCharacterAppearances(obj, { write: true });
           modal.close();
           app.renderSidebar();
           if (app.state.view === 'characters') app.renderMain();
-          app.renderInspector();
+          else app.renderInspector();
           toast(isNew ? '人物已创建' : '人物档案已更新', 'success');
+          } finally {
+            setButtonBusy(btn, false);
+          }
         },
       },
     ].filter(Boolean),
@@ -489,7 +503,7 @@ function renderLoreView(app) {
   const grid = el('div', { class: 'lore-grid' });
 
   const paint = () => {
-    const keyword = search.value.trim();
+    const keyword = search.value.trim().toLowerCase();
     chips.innerHTML = '';
     ['全部', ...categories].forEach(cat => {
       chips.appendChild(el('button', {
@@ -501,7 +515,8 @@ function renderLoreView(app) {
     grid.innerHTML = '';
     const entries = app.state.lore.filter(entry => {
       const inCat = selected === '全部' || entry.category === selected;
-      const kw = !keyword || [entry.name, entry.category, (entry.tags || []).join(' '), entry.content].join(' ').includes(keyword);
+      const kw = !keyword || [entry.name, entry.category, (entry.tags || []).join(' '), entry.content]
+        .map(v => String(v ?? '')).join(' ').toLowerCase().includes(keyword);
       return inCat && kw;
     });
     if (!entries.length) {
@@ -584,7 +599,10 @@ function openLoreEditor(app, entry) {
           const n = name.value.trim();
           if (!n) { name.focus(); return false; }
           const obj = {
-            ...(isNew ? { id: uid('lore'), projectId: app.state.project.id, createdAt: Date.now() } : {}),
+            // 编辑分支必须带上 id/projectId/createdAt：lore 的 keyPath 是 'id'，缺 id 会抛 DataError
+            ...(isNew
+              ? { id: uid('lore'), projectId: app.state.project.id, createdAt: Date.now() }
+              : { id: entry.id, projectId: entry.projectId, createdAt: entry.createdAt }),
             name: n,
             category: category.value.trim() || '未分类',
             tags: parseTags(tags.value),

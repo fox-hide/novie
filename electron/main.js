@@ -32,7 +32,18 @@ function createWindow() {
     return { action: 'deny' };
   });
   win.webContents.on('will-navigate', (event, url) => {
-    if (!url.startsWith('file://')) {
+    // 白名单：只允许应用自身的 index.html；其余 file:// 一律拦截
+    const selfPath = path.resolve(__dirname, '..', 'src', 'index.html');
+    let allowed = false;
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'file:') {
+        allowed = path.resolve(decodeURIComponent(u.pathname)) === selfPath;
+      }
+    } catch {
+      allowed = false;
+    }
+    if (!allowed) {
       event.preventDefault();
       if (/^https?:/i.test(url)) shell.openExternal(url);
     }

@@ -24,7 +24,9 @@ http.createServer((req, res) => {
   try {
     const urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
     let filePath = path.normalize(path.join(root, urlPath === '/' ? 'index.html' : urlPath));
-    if (!filePath.startsWith(root)) {
+    // path.relative 判定：src2 这类前缀目录不再能绕过 startsWith 检查
+    const relative = path.relative(root, filePath);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
       res.writeHead(403); res.end('Forbidden'); return;
     }
     if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {

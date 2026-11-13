@@ -1,7 +1,7 @@
 /* Novie — 人物关系星图（Canvas 2D，3D 球面投影 / 2D 弹簧引力双模式） */
 
 import { el, icon, makeButton, makeIconButton } from './ui.js';
-import { clamp, truncate } from './utils.js';
+import { clamp, truncate, safeColor } from './utils.js';
 
 const FACTION_COLORS = {
   core: '#38BDF8',
@@ -42,12 +42,13 @@ function factionOf(character) {
   return 'neutral';
 }
 
-function inferRelationType(labels) {
+export function inferRelationType(labels) {
   const text = labels.join(' ');
-  if (/恋人|挚爱|夫妻|喜欢|伴侣|旧约|爱/.test(text)) return 'love';
-  if (/父子|母子|师徒|师生|祖孙|传承|义母/.test(text)) return 'kin';
-  if (/仇|宿敌|死敌|对手|冲突|敌对/.test(text)) return 'enemy';
-  if (/兄弟|队友|同伴|损友|室友|老友|同事|七舍|盟友|伙伴/.test(text)) return 'bond';
+  // 含"恨/仇"的关系（如"由爱生恨"）不能先命中 love 分支
+  if (!/恨|仇/.test(text) && /恋人|挚爱|夫妻|喜欢|伴侣|旧约|爱/.test(text)) return 'love';
+  if (/父子|母子|父女|母女|师徒|师生|祖孙|传承|义母|亦师亦父|师父|师傅|师尊/.test(text)) return 'kin';
+  if (/仇|恨|宿敌|死敌|对手|冲突|敌对/.test(text)) return 'enemy';
+  if (/兄弟|队友|同伴|损友|室友|老友|同事|七舍|盟友|伙伴|队长|老大/.test(text)) return 'bond';
   return 'other';
 }
 
@@ -220,6 +221,8 @@ class StarMap {
 
   _onResize() {
     this._resize();
+    // 首帧尺寸就绪后立即 init，不再依赖 80ms 轮询兜底
+    if (!this.inited && !this.stopped && this.w && this.h) this.init();
   }
 
   _resize() {
@@ -237,13 +240,16 @@ class StarMap {
     this.canvas.style.width = `${w}px`;
     this.canvas.style.height = `${h}px`;
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    this.bgStars = Array.from({ length: 170 }, () => ({
-      x: Math.random(),
-      y: Math.random(),
-      r: 0.5 + Math.random() * 1.6,
-      a: 0.18 + Math.random() * 0.6,
-      phase: Math.random() * Math.PI * 2,
-    }));
+    // 背景星是归一化坐标，resize 不重建，避免整个星空跳变
+    if (!this.bgStars.length) {
+      this.bgStars = Array.from({ length: 170 }, () => ({
+        x: Math.random(),
+        y: Math.random(),
+        r: 0.5 + Math.random() * 1.6,
+        a: 0.18 + Math.random() * 0.6,
+        phase: Math.random() * Math.PI * 2,
+      }));
+    }
     this._project();
   }
 
@@ -282,9 +288,13 @@ class StarMap {
     const node = this.nodeMap.get(id);
     if (!node) return;
     if (this.mode === '3d') {
+      // 投影为 x1 = sx·cosY + sz·sinY、y2 = sy·cosX − z1·sinX：
+      // 要让该星落在屏幕中心必须 rotY = atan2(−sx, sz)、rotX = +asin(sy/r)，
+      // 符号写反会把镜像点转到中心
       const r = Math.hypot(node.sx, node.sy, node.sz) || 1;
-      this.targetRotY = Math.atan2(node.sx, node.sz);
-      this.targetRotX = -Math.asin(clamp(node.sy / r, -1, 1));
+      this.targetRotY = Math.atan2(-node.sx, node.sz);
+      // rotX 与手动拖拽共用 ±1.42 限位，避免目标角越过限位后 autoAlign 永不收敛
+      this.targetRotX = clamp(Math.asin(clamp(node.sy / r, -1, 1)), -1.42, 1.42);
       if (immediate) {
         this.rotX = this.targetRotX;
         this.rotY = this.targetRotY;
@@ -347,13 +357,17 @@ class StarMap {
     const dt = this.lastTime ? Math.min(2.2, (time - this.lastTime) / 16.667) : 1;
     this.lastTime = time;
     this.phase = (this.phase + 0.006 * dt) % 1;
-    this.zoom += (this.targetZoom - this.zoom) * 0.14;
+    // 平滑系数按 dt 归一：60Hz 与 144Hz 手感一致
+    const ease = k => 1 - Math.pow(1 - k, dt);
+    this.zoom += (this.targetZoom - this.zoom) * ease(0.14);
     if (this.mode === '3d') {
       if (this.autoAlign) {
-        const dx = this.targetRotX - this.rotX;
-        const dy = this.targetRotY - this.rotY;
-        this.rotX += dx * 0.1 * dt;
-        this.rotY += dy * 0.1 * dt;
+        // 角度差先做 ±π 环绕归一化，否则经度差接近 180° 时会倒转近一整圈
+        const wrap = a => ((a + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+        const dx = wrap(this.targetRotX - this.rotX);
+        const dy = wrap(this.targetRotY - this.rotY);
+        this.rotX = clamp(this.rotX + dx * ease(0.1), -1.42, 1.42);
+        this.rotY += dy * ease(0.1);
         if (Math.abs(dx) < 0.003 && Math.abs(dy) < 0.003) {
           this.rotX = this.targetRotX;
           this.rotY = this.targetRotY;
@@ -363,16 +377,16 @@ class StarMap {
         this.rotY += 0.0018 * dt;
       }
     } else {
-      this._step2D();
-      this.panX += (this.targetPanX - this.panX) * 0.1 * dt;
-      this.panY += (this.targetPanY - this.panY) * 0.1 * dt;
+      this._step2D(dt);
+      this.panX += (this.targetPanX - this.panX) * ease(0.1);
+      this.panY += (this.targetPanY - this.panY) * ease(0.1);
     }
     this._project();
     this._draw();
     this.raf = requestAnimationFrame(this._loop);
   }
 
-  _step2D() {
+  _step2D(dt) {
     const nodes = this.nodes;
     const repulsion = 6200;
     const springLength = 145;
@@ -388,10 +402,10 @@ class StarMap {
         const dist = Math.sqrt(distSq);
         const fx = (dx / dist) * force;
         const fy = (dy / dist) * force;
-        a.vx += fx;
-        a.vy += fy;
-        b.vx -= fx;
-        b.vy -= fy;
+        a.vx += fx * dt;
+        a.vy += fy * dt;
+        b.vx -= fx * dt;
+        b.vy -= fy * dt;
       }
     }
     for (const edge of this.graph.edges) {
@@ -404,10 +418,10 @@ class StarMap {
       const force = (dist - springLength) * springK;
       const fx = (dx / dist) * force;
       const fy = (dy / dist) * force;
-      a.vx += fx;
-      a.vy += fy;
-      b.vx -= fx;
-      b.vy -= fy;
+      a.vx += fx * dt;
+      a.vy += fy * dt;
+      b.vx -= fx * dt;
+      b.vy -= fy * dt;
     }
     for (const node of nodes) {
       if (this.dragNode === node.id) {
@@ -415,10 +429,11 @@ class StarMap {
         node.vy = 0;
         continue;
       }
-      node.vx *= 0.82;
-      node.vy *= 0.82;
-      node.x = clamp(node.x + node.vx, -520, 520);
-      node.y = clamp(node.y + node.vy, -380, 380);
+      const damp = Math.pow(0.82, dt);
+      node.vx *= damp;
+      node.vy *= damp;
+      node.x = clamp(node.x + node.vx * dt, -520, 520);
+      node.y = clamp(node.y + node.vy * dt, -380, 380);
     }
   }
 
@@ -457,8 +472,9 @@ class StarMap {
   _hitTest(x, y) {
     const sorted = [...this.nodes].sort((a, b) => b.depth - a.depth);
     for (const node of sorted) {
-      const radius = Math.max(9, node.size * 0.76 * node.scale * 1.25);
-      if (Math.hypot(x - node.screenX, y - node.screenY) <= radius) return node;
+      // 与 _drawNodes 的绘制半径保持一致，外加 4px 手指余量
+      const drawn = Math.max(4.5, node.size * 0.76 * node.scale);
+      if (Math.hypot(x - node.screenX, y - node.screenY) <= drawn + 4) return node;
     }
     return null;
   }
@@ -521,6 +537,8 @@ class StarMap {
     this.pointerDown = false;
     this.dragging = null;
     this.dragNode = null;
+    // 拖拽结束清除 hover 残留：tooltip 与 autoRotate 暂停都挂在 hoverId 上
+    this.hoverId = null;
     this.canvas.classList.remove('dragging');
   }
 
@@ -552,7 +570,6 @@ class StarMap {
     const h = this.h;
     ctx.clearRect(0, 0, w, h);
     this._drawBackground(ctx, w, h);
-    this._project();
     const visibleEdges = this._visibleEdges();
     const focus = this.nodeMap.get(this.selectedId);
     const neighbors = new Set();
@@ -1030,7 +1047,7 @@ export function renderStarMap(app, characters, { onEdit = null } = {}) {
     if (!character) return;
     jump.value = character.id;
     avatar.textContent = (character.name || '?').slice(0, 1);
-    avatar.style.background = character.color || '#8a5a3b';
+    avatar.style.background = safeColor(character.color);
     profileName.textContent = character.name;
     profileRole.textContent = character.role || '人物';
     aliasEl.textContent = character.alias || '暂无别名';

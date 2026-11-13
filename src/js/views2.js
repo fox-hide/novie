@@ -6,9 +6,10 @@ import {
 } from './ui.js';
 import { makePage, statTile, toolbarRow } from './view-kit.js';
 import {
-  fmtNumber, fmtWan, fmtDuration, truncate, uid, parseTags, addDays, dateKey, recentDateKeys, todayKey, htmlToText
+  fmtNumber, fmtWan, fmtDuration, truncate, uid, parseTags, addDays, dateKey, recentDateKeys,
+  todayKey, htmlToText, safeColor, averageDailyWords
 } from './utils.js';
-import { put, del, getAll } from './db.js';
+import { put, del, bulkPut, bulkDel, getChapterContent } from './db.js';
 import { chapterBalanceHint, analyzeChapterHook } from './generators.js';
 
 /* ============================= 素材库 ============================= */
@@ -63,10 +64,11 @@ function renderMaterials(app, body) {
       }));
     });
     grid.innerHTML = '';
-    const keyword = search.value.trim();
+    const keyword = search.value.trim().toLowerCase();
     const mats = app.state.materials.filter(m => {
       const inCat = selected === '全部' || (m.category || '未分类') === selected;
-      const kw = !keyword || [m.title, m.category, (m.tags || []).join(' '), m.content].join(' ').includes(keyword);
+      const kw = !keyword || [m.title, m.category, (m.tags || []).join(' '), m.content]
+        .map(v => String(v ?? '')).join(' ').toLowerCase().includes(keyword);
       return inCat && kw;
     });
     if (!mats.length) {
@@ -331,12 +333,12 @@ export function renderPlotView(app) {
   for (const line of app.state.plotlines) {
     const nodes = app.state.plotnodes
       .filter(n => n.plotlineId === line.id)
-      .sort((a, b) => (chapterOrder.get(a.chapterId)?.index ?? 999) - (chapterOrder.get(b.chapterId)?.index ?? 999));
+      .sort((a, b) => (chapterOrder.get(a.chapterId)?.index ?? Number.MAX_SAFE_INTEGER) - (chapterOrder.get(b.chapterId)?.index ?? Number.MAX_SAFE_INTEGER));
     const card = el('section', { class: 'plotline-card' });
     const head = el('div', { class: 'plotline-head' });
     const doneCount = nodes.filter(n => n.done).length;
     const progressPct = nodes.length ? Math.round((doneCount / nodes.length) * 100) : 0;
-    head.appendChild(el('span', { class: 'plot-color-bar', style: { background: line.color || '#b4552d' } }));
+    head.appendChild(el('span', { class: 'plot-color-bar', style: { background: safeColor(line.color, '#b4552d') } }));
     head.appendChild(el('div', { class: 'plotline-title-box' }, [
       el('h2', { text: line.name }),
       el('span', { class: 'muted small', text: `${nodes.length} 个节点 · ${doneCount} 已完成` }),
@@ -350,7 +352,7 @@ export function renderPlotView(app) {
     card.appendChild(head);
     card.appendChild(el('div', { class: 'plotline-progress' }, [
       el('div', { class: 'progress' }, [
-        el('span', { class: 'progress-bar', style: { width: `${progressPct}%`, background: line.color || undefined } }),
+        el('span', { class: 'progress-bar', style: { width: `${progressPct}%`, background: safeColor(line.color, '') || undefined } }),
       ]),
       el('span', { class: 'plotline-progress-label', text: `完成 ${progressPct}%` }),
     ]));
@@ -377,7 +379,7 @@ export function renderPlotView(app) {
         });
       });
       row.appendChild(check);
-      row.appendChild(el('span', { class: 'plot-node-dot', style: { background: node.color || line.color || '#b4552d' } }));
+      row.appendChild(el('span', { class: 'plot-node-dot', style: { background: safeColor(node.color || line.color || '#b4552d') } }));
       row.appendChild(el('div', { class: 'plot-node-main' }, [
         el('div', { class: 'plot-node-title' }, [
           el('strong', { text: node.title || '未命名节点' }),
@@ -403,7 +405,7 @@ export function renderPlotView(app) {
 function renderTimeline(app) {
   const chapterOrder = new Map(app.orderedChapters().map((c, i) => [c.id, { index: i, title: c.title, volumeTitle: c.volumeTitle }]));
   const nodes = [...app.state.plotnodes].sort((a, b) =>
-    (chapterOrder.get(a.chapterId)?.index ?? 999) - (chapterOrder.get(b.chapterId)?.index ?? 999)
+    (chapterOrder.get(a.chapterId)?.index ?? Number.MAX_SAFE_INTEGER) - (chapterOrder.get(b.chapterId)?.index ?? Number.MAX_SAFE_INTEGER)
   );
   const wrap = el('div', { class: 'timeline-wrap' });
   if (!nodes.length) {
@@ -423,7 +425,7 @@ function renderTimeline(app) {
     }
     const line = app.state.plotlines.find(p => p.id === node.plotlineId);
     const row = el('div', { class: `timeline-node ${node.done ? 'done' : ''}`.trim() });
-    row.appendChild(el('span', { class: 'timeline-dot', style: { background: node.color || line?.color || '#b4552d' } }));
+    row.appendChild(el('span', { class: 'timeline-dot', style: { background: safeColor(node.color || line?.color || '#b4552d') } }));
     const box = el('div', { class: 'timeline-node-box' });
     box.appendChild(el('div', { class: 'timeline-node-head' }, [
       el('strong', { text: node.title || '未命名节点' }),
@@ -493,16 +495,15 @@ async function deletePlotline(app, line) {
     danger: true, okLabel: '删除',
   });
   if (!ok) return;
-  for (const node of app.state.plotnodes.filter(n => n.plotlineId === line.id)) {
-    await del('plotnodes', node.id);
-  }
+  const nodeIds = app.state.plotnodes.filter(n => n.plotlineId === line.id).map(n => n.id);
+  await bulkDel('plotnodes', nodeIds);
   await del('plotlines', line.id);
   app.state.plotnodes = app.state.plotnodes.filter(n => n.plotlineId !== line.id);
   app.state.plotlines = app.state.plotlines.filter(l => l.id !== line.id);
   const affected = app.state.chapters
     .filter(ch => (ch.plotlineIds || []).includes(line.id))
     .map(ch => ({ ...ch, plotlineIds: (ch.plotlineIds || []).filter(id => id !== line.id) }));
-  for (const ch of affected) await put('chapters', ch);
+  await bulkPut('chapters', affected);
   app.state.chapters = app.state.chapters.map(ch => {
     const updated = affected.find(x => x.id === ch.id);
     return updated || ch;
@@ -582,6 +583,20 @@ function openPlotNodeEditor(app, node, presetLineId = null) {
           await put('plotnodes', obj);
           if (isNew) app.state.plotnodes.push(obj);
           else app.state.plotnodes = app.state.plotnodes.map(x => x.id === obj.id ? obj : x);
+          // 双轨同步：节点保存后把所属剧情线回写到关联章节的 plotlineIds，
+          // 保证大纲卡色点与剧情线页一致
+          if (obj.chapterId) {
+            const chapter = app.state.chapters.find(c => c.id === obj.chapterId);
+            if (chapter && !(chapter.plotlineIds || []).includes(obj.plotlineId)) {
+              const updated = {
+                ...chapter,
+                plotlineIds: [...(chapter.plotlineIds || []), obj.plotlineId],
+                updatedAt: Date.now(),
+              };
+              await put('chapters', updated);
+              app.replaceChapter(updated);
+            }
+          }
           modal.close();
           app.renderMain();
           if (app.state.activeChapter) app.renderInspector();
@@ -598,6 +613,7 @@ async function deletePlotNode(app, node) {
   await del('plotnodes', node.id);
   app.state.plotnodes = app.state.plotnodes.filter(n => n.id !== node.id);
   app.renderMain();
+  if (app.state.activeChapter) app.renderInspector();
 }
 
 /* ============================= 伏笔管理 ============================= */
@@ -643,8 +659,8 @@ function renderForeshadowList(app) {
   const ordered = app.orderedChapters();
   const order = new Map(ordered.map((c, i) => [c.id, i]));
   const sorted = [...items].sort((a, b) => {
-    const pa = a.plantChapterId != null ? order.get(a.plantChapterId) ?? 9999 : 9999;
-    const pb = b.plantChapterId != null ? order.get(b.plantChapterId) ?? 9999 : 9999;
+    const pa = a.plantChapterId != null ? order.get(a.plantChapterId) ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
+    const pb = b.plantChapterId != null ? order.get(b.plantChapterId) ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
     return pa - pb || (a.createdAt || 0) - (b.createdAt || 0);
   });
   const chapterBtn = (chapterId, label) => {
@@ -695,18 +711,42 @@ function renderForeshadowList(app) {
 }
 
 async function resolveForeshadow(app, f) {
-  const resolvedChapterId = app.state.chapterId || null;
-  const chapterTitle = resolvedChapterId
-    ? (app.state.chapters.find(c => c.id === resolvedChapterId)?.title || '当前章') : null;
-  const obj = {
-    ...f, resolved: true, resolvedChapterId,
-    resolvedAt: Date.now(), updatedAt: Date.now(),
-  };
-  await put('foreshadows', obj);
-  app.state.foreshadows = app.state.foreshadows.map(x => (x.id === f.id ? obj : x));
-  app.renderSidebar();
-  app.renderMain();
-  toast(chapterTitle ? `已标记回收（${chapterTitle}）` : '已标记回收', 'success');
+  // 回收章不应想当然记成"当前打开的章"——弹章节选择器，让用户明确指定
+  const ordered = app.orderedChapters();
+  const lastWritten = ordered.filter(c => (c.wordCount || 0) > 0).slice(-1)[0];
+  const select = el('select', { class: 'input' }, ordered.map(c =>
+    el('option', { value: c.id, text: `${c.volumeTitle ? c.volumeTitle + ' · ' : ''}${c.title}` })
+  ));
+  select.value = app.state.chapterId || lastWritten?.id || ordered[0]?.id || '';
+  showModal({
+    title: '标记伏笔已回收',
+    subtitle: f.title || '未命名伏笔',
+    body: el('div', { class: 'form-stack' }, [
+      el('p', { class: 'muted small', text: '选择实际回收了这条伏笔的章节，它会记录为“收于某章”。' }),
+      el('label', { class: 'field' }, [el('span', { class: 'field-label', text: '回收章节' }), select]),
+    ]),
+    width: 460,
+    actions: [
+      { label: '取消', ghost: true },
+      {
+        label: '确认回收', primary: true,
+        onClick: async () => {
+          const resolvedChapterId = select.value || null;
+          const chapterTitle = resolvedChapterId
+            ? (app.state.chapters.find(c => c.id === resolvedChapterId)?.title || '') : null;
+          const obj = {
+            ...f, resolved: true, resolvedChapterId,
+            resolvedAt: Date.now(), updatedAt: Date.now(),
+          };
+          await put('foreshadows', obj);
+          app.state.foreshadows = app.state.foreshadows.map(x => (x.id === f.id ? obj : x));
+          app.renderSidebar();
+          app.renderMain();
+          toast(chapterTitle ? `已标记回收（${chapterTitle}）` : '已标记回收', 'success');
+        },
+      },
+    ],
+  });
 }
 
 function openForeshadowEditor(app, f) {
@@ -845,7 +885,7 @@ export function renderStatsView(app) {
   goalCard.appendChild(makeButton('调整目标', {
     small: true, ghost: true,
     onClick: async () => {
-      const input = el('input', { class: 'input', type: 'number', min: 0, step: 500, value: goal || 3000 });
+      const input = el('input', { class: 'input', type: 'number', min: 0, step: 500, value: goal });
       const modal = showModal({
         title: '每日码字目标',
         body: el('label', { class: 'field' }, [el('span', { class: 'field-label', text: '目标字数' }), input]),
@@ -874,7 +914,7 @@ export function renderStatsView(app) {
   speedCard.appendChild(el('div', { class: 'kv-list' }, [
     el('div', { class: 'kv' }, [el('span', { text: '今日投入' }), el('strong', { text: fmtDuration(record.seconds) })]),
     el('div', { class: 'kv' }, [el('span', { text: '日均（近 7 天）' }), el('strong', {
-      text: `${fmtNumber(Math.round(app.state.daily.slice(-7).reduce((n, d) => n + d.words, 0) / 7))} 字`,
+      text: `${fmtNumber(averageDailyWords(app.state.daily, 7))} 字`,
     })]),
     el('div', { class: 'kv' }, [el('span', { text: '目标差额' }), el('strong', {
       text: goal ? (record.words >= goal ? `已超额 ${fmtNumber(record.words - goal)} 字` : `还差 ${fmtNumber(goal - record.words)} 字`) : '—',
@@ -1016,13 +1056,18 @@ export function renderStatsView(app) {
     const originalLabel = hookLabel.textContent;
     hookLabel.textContent = '分析中…';
     try {
-      const contents = await getAll('contents');
-      const htmlMap = new Map(contents.map(c => [c.id, c.html]));
+      // 逐章读取正文并定期让出主线程：多本长书不再一次性载入全部 contents
+      const ordered = app.orderedChapters();
       const rows = [];
-      for (const c of app.orderedChapters()) {
-        const text = htmlToText(htmlMap.get(c.id) || '');
+      for (let i = 0; i < ordered.length; i++) {
+        const c = ordered[i];
+        const html = c.id === app.state.chapterId && app.state.editor
+          ? app.state.editor.getHtml()
+          : await getChapterContent(c.id);
+        const text = htmlToText(html);
         if (!text.trim()) continue;
         rows.push({ chapter: c, ...analyzeChapterHook(text) });
+        if (i % 10 === 9) await new Promise(r => setTimeout(r, 0));
       }
       rows.sort((a, b) => a.score - b.score);
       hookList.innerHTML = '';

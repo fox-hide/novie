@@ -181,11 +181,16 @@ function blocksFromHtml(html) {
     else if (tag === 'HR') { flush(); blocks.push({ hr: true }); }
     else if (tag === 'UL' || tag === 'OL') {
       flush();
+      const ordered = tag === 'OL';
+      const start = ordered ? (Number(child.getAttribute('start')) || 1) : 1;
+      let index = 0;
       Array.from(child.children).forEach(li => {
         const runs = [];
         collectRuns(li, {}, runs);
         if (runs.some(r => r.br || (r.text && r.text.trim()))) {
-          blocks.push({ style: 'Body', runs: [{ text: '· ', ...{} }, ...runs] });
+          const bullet = ordered ? `${start + index}. ` : '· ';
+          index++;
+          blocks.push({ style: 'Body', runs: [{ text: bullet }, ...runs] });
         }
       });
     } else if (tag === 'BR') inlineNodes.push(child);

@@ -1,24 +1,24 @@
 /* Novie — 应用主控制器 */
 
 import {
-  $, uid, todayKey, dateKey, fmtNumber, fmtWan, fmtClock, parseTags, clamp, debounce,
-  safeFileName, isDesktop, htmlToText, countChars, plainTextToHtml, addDays
+  $, uid, todayKey, dateKey, fmtNumber, fmtClock, parseTags, clamp,
+  safeFileName, htmlToText, countChars, plainTextToHtml, addDays, safeColor
 } from './utils.js';
 import {
   icon, toast, el, showModal, confirmDialog, promptDialog, emptyState,
-  makeButton, makeIconButton, saveText, saveBytes, openFile, copyText
+  makeButton, makeIconButton, saveText, openFile
 } from './ui.js';
 import {
-  openDB, getAll, getAllBy, get, put, bulkPut, del, getApp, setApp,
-  getChapterContent, saveChapterContent, deleteChapterDeep, exportProjectBundle,
-  importProjectBundle, deleteProjectDeep, listBackups
+  openDB, getAll, getAllBy, get, put, bulkPut, bulkDel, del, getApp, setApp,
+  getChapterContent, saveChapterContent, deleteChapterDeep, applyChapterDeletionCascade,
+  repointChapterReferences, importProjectBundle, deleteProjectDeep
 } from './db.js';
-import { renderSidebar, renderGoalCard, showChapterInfo, openChapterMenu, openProjectMenu } from './sidebar.js';
+import { renderSidebar, renderGoalCard, showChapterInfo, openProjectMenu } from './sidebar.js';
 import { renderWriteTopbar, renderWriteView, renderInspector, renderTabs, renderStatusbar } from './write.js';
 import { renderView, VIEW_META, openCharacterEditor } from './views.js';
 import { createDemoProject } from './demo.js';
 import {
-  buildTxt, buildProjectJson, isEncryptedBackup, decryptBackup,
+  buildTxt, isEncryptedBackup, decryptBackup,
   hashPassword, verifyPassword, splitPlainText
 } from './exporters.js';
 import { openSearchModal } from './tools.js';
@@ -129,13 +129,14 @@ export class App {
         saveTimer: null,
         dailyTimer: null,
         cushionTimer: null,
-        pendingSeconds: 0,
+        retryTimer: null,
       },
       lock: null,
       unlocked: true,
       compare: { enabled: false, chapterId: null },
       draggedChapterId: null,
       goalHitDate: null,
+      openToken: 0,
       charView: 'graph',
       pendingSelect: null,
       selectedCharacterId: null,
@@ -248,6 +249,8 @@ export class App {
     document.addEventListener('keydown', e => this.onKeydown(e));
 
     window.addEventListener('beforeunload', e => {
+      // 卸载期 IndexedDB 不保证提交：同步写 localStorage 缓冲兜底尾部输入
+      this.flushCushionSync();
       if (this.state.lock) {
         e.preventDefault();
         e.returnValue = '小黑屋尚未完成，确定要离开吗？';
@@ -257,13 +260,42 @@ export class App {
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') {
+        this.flushCushionSync();
         this.saveCurrent('hidden');
-        this.persistDaily(true);
+        this.persistDaily(null, true);
       }
     });
   }
 
+  /** 同步落盘崩溃缓冲：不经防抖、不限 3MB；恢复路径 setContent 自带 sanitize。 */
+  flushCushionSync() {
+    try {
+      const editor = this.state.editor;
+      const chapter = this.state.activeChapter;
+      if (!editor || !chapter || !this.state.project) return;
+      const html = editor.getHtml();
+      if (!html) return;
+      localStorage.setItem('novie:cushion', JSON.stringify({
+        projectId: this.state.project.id,
+        chapterId: chapter.id,
+        html,
+        ts: Date.now(),
+      }));
+    } catch { /* 卸载期尽力而为 */ }
+  }
+
   onKeydown(e) {
+    // 密码锁收口：锁屏期间拦截全部应用快捷键（Ctrl+F 搜索 / Alt+切章 / Ctrl+J / F2 等），
+    // 只放行锁屏或其上层弹窗输入框内的正常键入
+    if (!this.state.unlocked) {
+      const t = e.target;
+      const inLockInput = t instanceof HTMLElement
+        && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)
+        && Boolean(t.closest('.lock-screen, .modal-overlay'));
+      if (inLockInput || e.key === 'Escape') return;
+      e.preventDefault();
+      return;
+    }
     const modalOpen = Boolean(document.querySelector('.modal-overlay'));
     if (e.key === 'Escape') {
       if (modalOpen) return;
@@ -287,14 +319,15 @@ export class App {
       this.createChapter({});
       return;
     }
-    if (mod && key === 'f') {
-      e.preventDefault();
-      openSearchModal(this);
-      return;
-    }
+    // 带 Shift 的分支必须在前面：Ctrl+Shift+F 的 e.key 小写化后仍是 'f'
     if (mod && e.shiftKey && key === 'f') {
       e.preventDefault();
       this.toggleFocus(true);
+      return;
+    }
+    if (mod && key === 'f' && !e.shiftKey) {
+      e.preventDefault();
+      openSearchModal(this);
       return;
     }
     if (mod && e.shiftKey && key === 't') {
@@ -339,6 +372,11 @@ export class App {
 
   async loadProject(projectId, { initial = false } = {}) {
     if (!projectId) return;
+    // 小黑屋收口：锁定期间禁止切换到其他作品（锁屏"切换作品"、云端恢复、导入等全部走这里）
+    if (this.state.lock && projectId !== this.state.project?.id) {
+      toast('小黑屋进行中，无法切换作品', 'warn');
+      return;
+    }
     if (!initial && this.state.activeChapter && this.state.editor) {
       await this.saveCurrent('switchProject');
     }
@@ -398,6 +436,7 @@ export class App {
     await setApp('settings', this.settings);
 
     this.restoreLock(projectId);
+    try { this.state.goalHitDate = localStorage.getItem(`novie:goalHit:${projectId}`) || null; } catch { this.state.goalHitDate = null; }
 
     let chapterId = null;
     if (this.state.lock) {
@@ -535,6 +574,12 @@ export class App {
     const wasCurrent = id === this.state.project?.id;
     const name = this.state.projects.find(p => p.id === id)?.name || '该作品';
     await deleteProjectDeep(id);
+    try {
+      localStorage.removeItem(`novie:lastChapter:${id}`);
+      localStorage.removeItem(`novie:lock:${id}`);
+      localStorage.removeItem(`novie:goalHit:${id}`);
+      localStorage.removeItem(`novie:collapsed:${id}`);
+    } catch { /* ignore */ }
     this.state.projects = await getAll('projects');
     if (wasCurrent) {
       this.destroyEditor();
@@ -687,10 +732,8 @@ export class App {
             const volumeId = uid('vol');
             const baseOrder = this.state.volumes.length;
             const now = Date.now();
-            await put('volumes', {
-              id: volumeId, projectId: this.state.project.id,
-              title: `导入 · ${baseName}`, order: baseOrder,
-            });
+            const chapterRows = [];
+            const contentRows = [];
             let order = 0;
             let firstChapterId = null;
             for (const c of chapters) {
@@ -698,17 +741,26 @@ export class App {
               if (!firstChapterId) firstChapterId = id;
               const html = plainTextToHtml(c.content);
               const chars = countChars(c.content);
-              await put('chapters', {
+              chapterRows.push({
                 id, projectId: this.state.project.id, volumeId,
                 title: c.title, order: order++, summary: '', status: 'todo',
                 targetWords: 0, tags: ['导入'], plotlineIds: [],
                 wordCount: chars, wordCountNoPunct: countChars(c.content, true),
                 mentions: [], createdAt: now, updatedAt: now,
               });
-              await put('contents', { id, html, updatedAt: now });
+              contentRows.push({ id, html, updatedAt: now });
             }
+            await put('volumes', {
+              id: volumeId, projectId: this.state.project.id,
+              title: `导入 · ${baseName}`, order: baseOrder,
+            });
+            await bulkPut('chapters', chapterRows);
+            await bulkPut('contents', contentRows);
             modal.close();
-            await this.reloadProjectData();
+            // 重新读库刷新目录（此前调用的 reloadProjectData 未定义，导入后必抛 TypeError）
+            const refreshed = await getAllBy('chapters', 'projectId', this.state.project.id);
+            this.state.chapters = refreshed.sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || (a.createdAt || 0) - (b.createdAt || 0));
+            this.renderSidebar();
             if (firstChapterId) await this.openChapter(firstChapterId);
             toast(`已导入 ${chapters.length} 章`, 'success', 3000);
           },
@@ -849,6 +901,10 @@ export class App {
   /* ============================= Chapter lifecycle ============================= */
 
   destroyEditor() {
+    // 跨章/跨视图残留的自动保存定时器会用新编辑器内容覆写新章，必须随编辑器一起清掉
+    clearTimeout(this.state.session.saveTimer);
+    clearTimeout(this.state.session.cushionTimer);
+    clearTimeout(this.state.session.retryTimer);
     if (this.state.editor) {
       try { this.state.editor.destroy(); } catch { /* ignore */ }
       this.state.editor = null;
@@ -876,7 +932,8 @@ export class App {
   }
 
   async openChapter(id, { skipSave = false } = {}) {
-    if (this.state.lock && this.state.chapterId && id !== this.state.chapterId) {
+    // 小黑屋收口：锁定期只允许停留在锁定的那一章（不再依赖 chapterId 是否为空）
+    if (this.state.lock && id !== this.state.lock.chapterId) {
       toast('小黑屋进行中，无法切换章节', 'warn');
       return;
     }
@@ -886,8 +943,17 @@ export class App {
       this.state.editor.focus();
       return;
     }
-    if (!skipSave) await this.saveCurrent('switchChapter');
+    // 递增 token：连续快速点击两章时，只有最后一次点击的结果生效
+    const token = ++this.state.openToken;
+    // 立即冻结旧编辑器（contenteditable=false 不影响读取内容）：
+    // 等待保存/读库期间的键入不会既丢内容又计入今日字数
+    if (this.state.editor) this.state.editor.root.setAttribute('contenteditable', 'false');
+    if (!skipSave) {
+      await this.saveCurrent('switchChapter');
+    }
+    if (token !== this.state.openToken) return;
     const html = await getChapterContent(id);
+    if (token !== this.state.openToken) return;
     this.destroyEditor();
     this.state.chapterId = id;
     this.state.activeChapter = chapter;
@@ -912,6 +978,11 @@ export class App {
   }
 
   async closeTab(id) {
+    // 小黑屋收口：锁定期关闭标签可能清空 chapterId，从而绕过 openChapter 的锁检查
+    if (this.state.lock) {
+      toast('小黑屋进行中，无法关闭标签页', 'warn');
+      return;
+    }
     const tabs = this.state.openTabs;
     const index = tabs.indexOf(id);
     if (index < 0) return;
@@ -1062,7 +1133,14 @@ export class App {
       { title: '删除卷', danger: true, okLabel: '删除整卷' }
     );
     if (!ok) return;
+    let clearedTotal = 0;
     for (const c of chapters) {
+      const cascade = applyChapterDeletionCascade(
+        { plotnodes: this.state.plotnodes, foreshadows: this.state.foreshadows }, c.id
+      );
+      this.state.plotnodes = cascade.plotnodes;
+      this.state.foreshadows = cascade.foreshadows;
+      clearedTotal += cascade.cleared;
       this.state.chapters = this.state.chapters.filter(x => x.id !== c.id);
       this.state.openTabs = this.state.openTabs.filter(t => t !== c.id);
       await deleteChapterDeep(c.id);
@@ -1079,6 +1157,9 @@ export class App {
       this.refreshCurrentView();
     }
     toast('卷已删除', 'info');
+    if (clearedTotal) {
+      toast(`已同步断开 ${clearedTotal} 处剧情节点 / 伏笔引用`, 'info', 3600);
+    }
   }
 
   async renameChapter(id) {
@@ -1172,6 +1253,11 @@ export class App {
       this.state.activeChapter = null;
       this.state.currentHtml = '';
     }
+    const cascade = applyChapterDeletionCascade(
+      { plotnodes: this.state.plotnodes, foreshadows: this.state.foreshadows }, id
+    );
+    this.state.plotnodes = cascade.plotnodes;
+    this.state.foreshadows = cascade.foreshadows;
     await deleteChapterDeep(id);
     if (wasActive) {
       if (fallback) await this.openChapter(fallback, { skipSave: true });
@@ -1180,6 +1266,9 @@ export class App {
       this.refreshCurrentView();
     }
     toast('章节已删除', 'info');
+    if (cascade.cleared) {
+      toast(`已同步断开 ${cascade.cleared} 处剧情节点 / 伏笔对本章的引用`, 'info', 3600);
+    }
   }
 
   async moveChapter(id, targetVolumeId, targetIndex) {
@@ -1225,7 +1314,11 @@ export class App {
     // 拆章是内容搬移：suppress 今日计数，避免后半章被当成“删除”
     this.state.session.suppressTodayDelta = true;
     let parts;
+    let preSplitHtml = null;
     try {
+      // 快照必须在 splitAtCaret 之前捕获：拆分会同步改写编辑器，
+      // 之后再读 getHtml() 只剩前半章，"拆分前快照"就名不副实了
+      preSplitHtml = this.state.editor.getHtml();
       parts = this.state.editor.splitAtCaret();
     } finally {
       this.state.session.suppressTodayDelta = false;
@@ -1234,7 +1327,7 @@ export class App {
       toast('光标之后没有内容，无法拆分', 'warn');
       return;
     }
-    await this.createSnapshot(chapter.id, { label: '拆分前快照', silent: true });
+    await this.createSnapshot(chapter.id, { label: '拆分前快照', html: preSplitHtml, silent: true });
     const countsBefore = this.state.editor.getCounts();
     const beforeChapter = {
       ...chapter,
@@ -1322,8 +1415,32 @@ export class App {
     this.state.chapters = this.state.chapters.filter(c => c.id !== next.id);
     this.state.openTabs = this.state.openTabs.filter(t => t !== next.id);
     await deleteChapterDeep(next.id);
+    // 被合并章的剧情节点/伏笔引用改指向合并后的章，避免悬挂后被静默洗白
+    const beforeNodes = this.state.plotnodes;
+    const beforeForeshadows = this.state.foreshadows;
+    const repointed = repointChapterReferences(
+      { plotnodes: beforeNodes, foreshadows: beforeForeshadows },
+      next.id, chapter.id
+    );
+    repointed.plotnodes.forEach((n, i) => { if (n !== beforeNodes[i]) put('plotnodes', n); });
+    repointed.foreshadows.forEach((f, i) => { if (f !== beforeForeshadows[i]) put('foreshadows', f); });
+    this.state.plotnodes = repointed.plotnodes;
+    this.state.foreshadows = repointed.foreshadows;
     if (this.state.chapterId === chapter.id) {
       this.state.activeChapter = updated;
+      if (this.state.editor) {
+        this.state.editor.setContent(merged);
+        this.state.session.lastCount = this.state.editor.getCounts().chars;
+      }
+    }
+    // 被合并的下一章可能正是当前打开章（对上一章执行"与下一章合并"）：
+    // 必须把编辑器迁回合并后的章，否则此后所有输入都无法落库
+    if (this.state.chapterId === next.id) {
+      this.state.chapterId = chapter.id;
+      this.state.activeChapter = updated;
+      this.state.currentHtml = merged;
+      if (!this.state.openTabs.includes(chapter.id)) this.state.openTabs.push(chapter.id);
+      try { localStorage.setItem(`novie:lastChapter:${this.state.project.id}`, chapter.id); } catch { /* ignore */ }
       if (this.state.editor) {
         this.state.editor.setContent(merged);
         this.state.session.lastCount = this.state.editor.getCounts().chars;
@@ -1388,10 +1505,12 @@ export class App {
     const record = this.getTodayRecord();
     // 净变化计数：删除会回落，但今日累计不会低于 0（不会吃掉往日统计）
     record.words = Math.max(0, record.words + n);
-    this.scheduleDailySave();
+    // 捕获 record 引用而不是日 Key：跨午夜落盘时仍写入输入发生的那一天
+    this.scheduleDailySave(record);
     const goal = this.state.project.dailyGoal || 0;
     if (goal > 0 && record.words >= goal && this.state.goalHitDate !== record.date) {
       this.state.goalHitDate = record.date;
+      try { localStorage.setItem(`novie:goalHit:${this.state.project.id}`, record.date); } catch { /* ignore */ }
       toast(`今日目标达成：${fmtNumber(record.words)} / ${fmtNumber(goal)} 字`, 'success', 3800);
     }
   }
@@ -1400,21 +1519,21 @@ export class App {
     if (!this.state.project) return;
     const record = this.getTodayRecord();
     record.seconds += seconds;
-    this.scheduleDailySave();
+    this.scheduleDailySave(record);
   }
 
-  scheduleDailySave() {
+  scheduleDailySave(record = null) {
     clearTimeout(this.state.session.dailyTimer);
-    this.state.session.dailyTimer = setTimeout(() => this.persistDaily(), 4000);
+    this.state.session.dailyTimer = setTimeout(() => this.persistDaily(record), 4000);
   }
 
-  async persistDaily(force = false) {
+  async persistDaily(record = null, force = false) {
     if (!this.state.project) return;
     clearTimeout(this.state.session.dailyTimer);
-    const record = this.getTodayRecord();
-    if (!record) return;
-    if (!force && !record.words && !record.seconds) return;
-    try { await put('daily', record); } catch (err) { console.warn('保存统计失败', err); }
+    const rec = record || this.getTodayRecord();
+    if (!rec) return;
+    if (!force && !rec.words && !rec.seconds) return;
+    try { await put('daily', rec); } catch (err) { console.warn('保存统计失败', err); }
   }
 
   handleEditorChange(counts) {
@@ -1455,7 +1574,7 @@ export class App {
     }, 1200);
   }
 
-  tryRestoreCushion() {
+  async tryRestoreCushion() {
     try {
       const raw = localStorage.getItem('novie:cushion');
       if (!raw) return;
@@ -1464,7 +1583,11 @@ export class App {
       if (!chapter || !this.state.editor) return;
       if (cushion.projectId !== this.state.project.id || cushion.chapterId !== chapter.id) return;
       if (!cushion.html) return;
-      if (Number(cushion.ts) <= Number(chapter.updatedAt || 0) + 1000) return;
+      // 判据用 contents 表的 updatedAt：重命名/改标签会刷 chapters.updatedAt，
+      // 但不代表正文已落盘，不能用它误判"缓冲已过期"
+      let contentTs = 0;
+      try { contentTs = (await get('contents', chapter.id))?.updatedAt || 0; } catch { /* ignore */ }
+      if (Number(cushion.ts) <= Number(contentTs || 0) + 1000) return;
       if (cushion.html === this.state.editor.getHtml()) return;
       this.state.editor.setContent(cushion.html);
       const counts = this.state.editor.getCounts();
@@ -1509,15 +1632,35 @@ export class App {
         console.error(err);
         this.setSaveState('error');
         toast('保存失败：' + (err.message || err), 'error', 4200);
+        // quota/IDB 临时故障：定时重试，避免用户停止输入后正文永不落盘
+        this.scheduleSaveRetry();
       }
     };
     this._saveChain = this._saveChain.catch(() => {}).then(run);
     return this._saveChain;
   }
 
+  scheduleSaveRetry() {
+    clearTimeout(this.state.session.retryTimer);
+    this.state.session.retryTimer = setTimeout(() => {
+      if (this.state.saveState === 'error' && this.state.editor && this.state.activeChapter) {
+        this.saveCurrent('retry');
+      }
+    }, 5000);
+  }
+
   async persistChapterSnapshot(snapshot) {
     const latest = this.state.chapters.find(c => c.id === snapshot.chapter.id);
-    if (!latest) return;
+    if (!latest) {
+      // 章已被删除（合并/删章竞态）：绝不静默丢弃，提示用户内容仍在编辑器中
+      this.setSaveState('error');
+      const now = Date.now();
+      if (!this._lastOrphanToast || now - this._lastOrphanToast > 30000) {
+        this._lastOrphanToast = now;
+        toast('当前章节已被删除，内容无法再保存。请新建章节，把编辑器中的内容复制过去。', 'error', 6000);
+      }
+      return;
+    }
     const now = Date.now();
     await saveChapterContent(latest.id, snapshot.html);
     const updated = {
@@ -1535,12 +1678,17 @@ export class App {
       this.state.currentHtml = snapshot.html;
       this.state.lastSavedAt = now;
       this.setSaveState('saved');
-      this.renderTabs();
-      this.renderStatusbar();
-      this.renderTopbar();
-      this.renderSidebar();
-      this.renderGoalCard();
-      this.updateDocumentTitle();
+      if (snapshot.reason === 'auto' || snapshot.reason === 'retry') {
+        // 自动保存路径只做增量字数/状态更新，避免打字节奏下全量重建侧栏/顶栏
+        this.renderStatusLive();
+      } else {
+        this.renderTabs();
+        this.renderStatusbar();
+        this.renderTopbar();
+        this.renderSidebar();
+        this.renderGoalCard();
+        this.updateDocumentTitle();
+      }
     } else {
       this.renderSidebar();
     }
@@ -1555,7 +1703,8 @@ export class App {
   /** 数据健康时间线：同类事件 1 分钟节流，最多保留 120 条，供“数据健康”面板展示。 */
   async logHealth(type, label = '') {
     try {
-      const log = (await getApp('healthLog')) || [];
+      if (!this._healthLogCache) this._healthLogCache = (await getApp('healthLog')) || [];
+      const log = this._healthLogCache;
       const now = Date.now();
       const last = log[0];
       if (last && last.type === type && now - (last.t || 0) < 60000) return;
@@ -1686,7 +1835,7 @@ export class App {
     await put('versions', version);
     const all = await getAllBy('versions', 'chapterId', chapterId);
     const sorted = all.sort((a, b) => b.createdAt - a.createdAt);
-    for (const old of sorted.slice(20)) await del('versions', old.id);
+    await bulkDel('versions', sorted.slice(20).map(v => v.id));
     this.logHealth('snapshot', label);
     if (!silent) toast('已创建历史快照', 'success', 1600);
     if (this.state.chapterId === chapterId && this.state.rightTab === 'meta') this.renderInspector();
@@ -1933,6 +2082,7 @@ export class App {
   /* ============================= Compare / focus / typewriter ============================= */
 
   async openCompareFlow() {
+    if (this.isLocked()) { toast('小黑屋进行中，无法对照其他章节', 'warn'); return; }
     if (!this.state.activeChapter) return;
     const ordered = this.orderedChapters().filter(c => c.id !== this.state.chapterId);
     if (!ordered.length) { toast('没有其他章节可对照', 'info'); return; }
@@ -1964,6 +2114,7 @@ export class App {
 
   async openCompare(chapterId) {
     if (!chapterId) return;
+    if (this.isLocked()) { toast('小黑屋进行中，无法对照其他章节', 'warn'); return; }
     await this.saveCurrent('compare');
     const html = await getChapterContent(chapterId);
     this.state.compare = { enabled: true, chapterId, html };
@@ -1981,9 +2132,6 @@ export class App {
 
   toggleFocus(force = null) {
     const next = force === null ? !this.state.focusMode : Boolean(force);
-    if (next && this.state.lock) {
-      // 小黑屋下允许隐藏界面，但不能离开
-    }
     this.state.focusMode = next;
     this.applyClasses();
     this.renderTopbar();
@@ -2064,7 +2212,7 @@ export class App {
     document.documentElement.style.setProperty('--editor-size', `${s.fontSize || 18}px`);
     document.documentElement.style.setProperty('--editor-line', String(s.lineHeight || 2));
     document.documentElement.style.setProperty('--editor-width', `${s.width || 780}px`);
-    document.documentElement.style.setProperty('--bg-image', s.bg ? `url("${s.bg}")` : 'none');
+    document.documentElement.style.setProperty('--bg-image', s.bg ? `url("${String(s.bg).replace(/"/g, '%22')}")` : 'none');
     document.documentElement.style.setProperty('--bg-image-opacity', String(s.bgOpacity ?? 0.14));
     document.body.classList.toggle('has-bg', Boolean(s.bg));
     const themeBtn = $('#btn-theme');
@@ -2079,7 +2227,8 @@ export class App {
       themePickerBtn.title = `选择主题（当前：${THEMES.find(t => t.key === s.theme)?.label || ''}）`;
       themePickerBtn.setAttribute('aria-label', '选择主题');
     }
-    document.title = this.state.project ? `${this.state.project.name} — Novie` : 'Novie · 本地码字工坊';
+    // 保留"卷 / 章名 · 书名"的完整标题，而不是覆写成纯书名
+    this.updateDocumentTitle();
   }
 
   /* ============================= Misc UI ============================= */
@@ -2097,6 +2246,7 @@ export class App {
     await this.createSnapshot(this.state.activeChapter.id, { label: '排版前快照', silent: true });
     // 排版是格式调整（可能删掉段首空格），不计入今日码字增减
     this.state.session.suppressTodayDelta = true;
+    const countsBefore = this.state.editor.getCounts();
     let result;
     try {
       result = this.state.editor.smartTypeset();
@@ -2106,6 +2256,16 @@ export class App {
     if (!result.changed && !result.removed) {
       toast('排版检查完成：没有需要修改的地方', 'info', 2200);
       return;
+    }
+    // 小黑屋中排版净删字符会让 wordsDone 倒退：同步下调 startWords 保持进度
+    const lock = this.state.lock;
+    if (lock && this.state.activeChapter?.id === lock.chapterId) {
+      const countsAfter = this.state.editor.getCounts();
+      const mode = this.settings.countNoPunct ? 'charsNoPunct' : 'chars';
+      const delta = Math.max(0, (countsBefore[mode] || 0) - (countsAfter[mode] || 0));
+      if (delta > 0) lock.startWords = Math.max(0, lock.startWords - delta);
+      this.persistLock();
+      this.updateLockText();
     }
     toast(`排版完成：清理空段 ${result.removed} 个，调整 ${result.changed} 处`, 'success', 2600);
     this.saveCurrent('typeset');
@@ -2159,26 +2319,32 @@ export class App {
 
   openChapterInfoById(id) { showChapterInfo(this, id); }
 
-  async scanCharacterAppearances(character) {
+  /**
+   * 扫描人物出场。write=false 时只读返回命中章节（供编辑表单预览），
+   * 确认保存时再以 write=true 按最终姓名统一写回 mentions。
+   * 逐章读取正文并定期让出主线程，避免多本长书一次性载入全部正文造成内存尖峰。
+   */
+  async scanCharacterAppearances(character, { write = true } = {}) {
     if (!character) return [];
     const names = [character.name, ...(character.alias || '').split(/[\/，,、\s]+/)]
       .map(s => String(s || '').trim()).filter(s => s.length >= 2);
-    const contents = await getAll('contents');
-    const contentMap = new Map(contents.map(c => [c.id, c.html]));
     const appeared = [];
-    for (const chapter of this.state.chapters) {
-      const html = contentMap.get(chapter.id) || '';
+    const chapters = this.state.chapters;
+    for (let i = 0; i < chapters.length; i++) {
+      const chapter = chapters[i];
+      const html = chapter.id === this.state.chapterId && this.state.editor
+        ? this.state.editor.getHtml()
+        : await getChapterContent(chapter.id);
       const text = htmlToText(html);
       if (!names.some(n => text.includes(n))) continue;
       appeared.push(chapter);
-      const mentions = new Set(chapter.mentions || []);
-      if (!mentions.has(character.id)) {
-        mentions.add(character.id);
-        chapter.mentions = Array.from(mentions);
-        await put('chapters', chapter);
+      if (write && !(chapter.mentions || []).includes(character.id)) {
+        const updated = { ...chapter, mentions: [...(chapter.mentions || []), character.id] };
+        await put('chapters', updated);
+        this.replaceChapter(updated);
       }
+      if (i % 10 === 9) await new Promise(r => setTimeout(r, 0));
     }
-    this.state.chapters = this.state.chapters.map(c => ({ ...c }));
     return appeared;
   }
 
@@ -2192,7 +2358,7 @@ export class App {
       ['Ctrl + Shift + T', '打字机模式'],
       ['Ctrl + J', '一键网文排版（清理空格、规范引号、删空段）'],
       ['Ctrl + Shift + E', '打开导出页'],
-      ['Alt + 1 ~ 4', '插入前四个快捷短语'],
+      ['Alt + 1 ~ 9', '插入前九个快捷短语'],
       ['Alt + ← / →', '上一章 / 下一章'],
       ['F2', '重命名当前章节'],
       ['Tab（输入快捷短语后）', '展开快捷短语'],
@@ -2260,15 +2426,18 @@ export class App {
     const body = el('div', { class: 'project-list' });
     this.state.projects.forEach(p => {
       const row = el('div', { class: 'project-row' }, [
-        el('span', { class: 'project-avatar', style: { background: p.color || '#8a5a3b' }, text: (p.name || '未')[0] }),
+        el('span', { class: 'project-avatar', style: { background: safeColor(p.color) }, text: (p.name || '未')[0] }),
         el('div', { class: 'project-row-meta' }, [
           el('strong', { text: p.name }),
           el('span', { class: 'muted small', text: p.author || '佚名' }),
         ]),
         makeButton('打开', { small: true, onClick: async () => {
-          this.closeLockScreen();
+          // 顺序很重要：先关弹窗（onClose 会在未解锁时重建锁屏，保持状态一致），
+          // 再加载作品；若新作品也有密码，loadProject 会自行挂上新锁屏
           modal.close();
           await this.loadProject(p.id);
+          this.closeLockScreen();
+          if (this.state.lock || !this.state.unlocked) this.showLockScreen();
         } }),
       ]);
       body.appendChild(row);

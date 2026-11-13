@@ -118,6 +118,15 @@ export async function bulkPut(store, values) {
   await done(tx);
 }
 
+export async function bulkDel(store, keys) {
+  if (!keys || !keys.length) return;
+  const db = await openDB();
+  const tx = db.transaction(store, 'readwrite');
+  const os = tx.objectStore(store);
+  keys.forEach(k => os.delete(k));
+  await done(tx);
+}
+
 export async function del(store, key) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -146,10 +155,80 @@ export async function saveChapterContent(chapterId, html) {
   await put('contents', { id: chapterId, html, updatedAt: Date.now() });
 }
 
+/**
+ * 纯函数：删除章节时的引用级联。被删章关联的剧情节点 chapterId 置 null、
+ * 伏笔的埋设/预计回收/回收三段章 id 置 null——避免"悬挂引用被静默洗白"。
+ * 未变化的行返回原引用，方便调用方识别需要回写的行。测试与 deleteChapterDeep 共用。
+ */
+export function applyChapterDeletionCascade({ plotnodes = [], foreshadows = [] }, chapterId) {
+  let cleared = 0;
+  const nextNodes = plotnodes.map(n => {
+    if (!n || n.chapterId !== chapterId) return n;
+    cleared++;
+    return { ...n, chapterId: null };
+  });
+  const nextForeshadows = foreshadows.map(f => {
+    if (!f) return f;
+    let changed = false;
+    const out = { ...f };
+    for (const key of ['plantChapterId', 'targetChapterId', 'resolvedChapterId']) {
+      if (out[key] === chapterId) { out[key] = null; changed = true; }
+    }
+    if (changed) cleared++;
+    return changed ? out : f;
+  });
+  return { plotnodes: nextNodes, foreshadows: nextForeshadows, cleared };
+}
+
+/** 纯函数：合并章节时，把指向被删章的引用改指向合并后的目标章。 */
+export function repointChapterReferences({ plotnodes = [], foreshadows = [] }, fromId, toId) {
+  const nextNodes = plotnodes.map(n => {
+    if (!n || n.chapterId !== fromId) return n;
+    return { ...n, chapterId: toId };
+  });
+  const nextForeshadows = foreshadows.map(f => {
+    if (!f) return f;
+    let changed = false;
+    const out = { ...f };
+    for (const key of ['plantChapterId', 'targetChapterId', 'resolvedChapterId']) {
+      if (out[key] === fromId) { out[key] = toId; changed = true; }
+    }
+    return changed ? out : f;
+  });
+  return { plotnodes: nextNodes, foreshadows: nextForeshadows };
+}
+
 export async function deleteChapterDeep(chapterId) {
-  await del('contents', chapterId);
-  const versions = await getAllBy('versions', 'chapterId', chapterId);
-  for (const v of versions) await del('versions', v.id);
+  const db = await openDB();
+  // 单事务完成：删正文 + 删快照 + 级联清理剧情/伏笔引用
+  const tx = db.transaction(['contents', 'versions', 'plotnodes', 'foreshadows'], 'readwrite');
+  const contents = tx.objectStore('contents');
+  const versions = tx.objectStore('versions');
+  const plotnodes = tx.objectStore('plotnodes');
+  const foreshadows = tx.objectStore('foreshadows');
+  let clearedRefs = 0;
+  contents.delete(chapterId);
+  const vReq = versions.index('chapterId').getAll(chapterId);
+  vReq.onsuccess = () => { (vReq.result || []).forEach(v => versions.delete(v.id)); };
+  // plotnodes 没有 chapterId 索引（DB v2 的既有 schema），getAll 后内存过滤；
+  // 剧情节点与伏笔统一走级联纯函数
+  let nodesResult = null;
+  let foreshadowResult = null;
+  const applyCascade = () => {
+    if (!nodesResult || !foreshadowResult) return;
+    const cascade = applyChapterDeletionCascade(
+      { plotnodes: nodesResult, foreshadows: foreshadowResult }, chapterId
+    );
+    clearedRefs += cascade.cleared;
+    cascade.plotnodes.forEach((n, i) => { if (n !== nodesResult[i]) plotnodes.put(n); });
+    cascade.foreshadows.forEach((f, i) => { if (f !== foreshadowResult[i]) foreshadows.put(f); });
+  };
+  const nReq = plotnodes.getAll();
+  nReq.onsuccess = () => { nodesResult = nReq.result || []; applyCascade(); };
+  const fReq = foreshadows.getAll();
+  fReq.onsuccess = () => { foreshadowResult = fReq.result || []; applyCascade(); };
+  await done(tx);
+  return { clearedRefs };
 }
 
 /** 导出完整工程包（不含密码哈希与内部备份）。 */
@@ -319,15 +398,27 @@ export async function importProjectBundle(bundle, { nameSuffix = '（导入）' 
 }
 
 export async function deleteProjectDeep(projectId) {
-  const chapters = await getAllBy('chapters', 'projectId', projectId);
-  for (const c of chapters) {
-    await del('contents', c.id);
-  }
-  for (const store of PROJECT_SCOPED_STORES) {
-    const rows = await getAllBy(store, 'projectId', projectId);
-    for (const row of rows) await del(store, row.id);
-  }
-  await del('projects', projectId);
+  const db = await openDB();
+  // 单事务删除整个工程：正文、各业务表与 project 行要么全部成功，要么全部回滚
+  const storeNames = ['projects', 'contents', ...PROJECT_SCOPED_STORES];
+  const tx = db.transaction(storeNames, 'readwrite');
+  await new Promise((resolve, reject) => {
+    const fail = () => reject(tx.error || new Error('删除作品失败'));
+    tx.onerror = () => fail();
+    tx.onabort = () => fail();
+    const chReq = tx.objectStore('chapters').index('projectId').getAll(projectId);
+    chReq.onsuccess = () => {
+      const os = tx.objectStore('contents');
+      (chReq.result || []).forEach(c => os.delete(c.id));
+    };
+    for (const store of PROJECT_SCOPED_STORES) {
+      const os = tx.objectStore(store);
+      const req = os.index('projectId').getAll(projectId);
+      req.onsuccess = () => { (req.result || []).forEach(row => os.delete(row.id)); };
+    }
+    tx.objectStore('projects').delete(projectId);
+    tx.oncomplete = () => resolve();
+  });
 }
 
 export async function saveBackupSnapshot(projectId, bundle, keep = 4) {
@@ -340,7 +431,7 @@ export async function saveBackupSnapshot(projectId, bundle, keep = 4) {
   };
   await put('backups', record);
   const all = (await getAllBy('backups', 'projectId', projectId)).sort((a, b) => b.createdAt - a.createdAt);
-  for (const old of all.slice(keep)) await del('backups', old.id);
+  await bulkDel('backups', all.slice(keep).map(b => b.id));
   return record;
 }
 

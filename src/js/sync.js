@@ -241,15 +241,19 @@ export async function webdavRestore(app) {
   try {
     const wd = ensureConfigured(app);
     const wdState = app.settings.webdav || {};
-    // 候选顺序：本机记录的最近上传优先，其次按云端目录时间戳倒序
+    // 候选顺序：云端目录按时间戳倒序（与 README §2.4 一致）；
+    // 本机记录的最近上传只作为列目录失败时的兜底，不再优先于更新的云端文件
     const candidates = [];
-    if (wdState.lastUploadName) candidates.push(wdState.lastUploadName);
     try {
       for (const f of await listRemoteFiles(app, wd)) {
         if (!candidates.includes(f.name)) candidates.push(f.name);
       }
     } catch (err) {
-      if (!candidates.length) throw err;
+      if (wdState.lastUploadName) candidates.push(wdState.lastUploadName);
+      else throw err;
+    }
+    if (wdState.lastUploadName && !candidates.includes(wdState.lastUploadName)) {
+      candidates.push(wdState.lastUploadName);
     }
     if (!candidates.length) return { ok: false, message: '云端还没有备份文件' };
 

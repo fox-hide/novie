@@ -3,7 +3,7 @@
  * 不复制正文，只写入人工整理的元数据；可重复运行（会先清空该书目的旧元数据）。
  */
 import {
-  getAll, getAllBy, put, bulkPut, del,
+  getAll, getAllBy, put, bulkPut, bulkDel,
 } from './db.js';
 import { uid, htmlToText } from './utils.js';
 
@@ -30,10 +30,10 @@ export async function applyEnrichment(app, data) {
     chapter.updatedAt = now;
   });
 
-  // 2) 清理旧元数据，避免重复导入累积
+  // 2) 清理旧元数据，避免重复导入累积（每表单事务批量删除）
   for (const store of META_STORES) {
     const rows = await getAllBy(store, 'projectId', project.id);
-    for (const row of rows) await del(store, row.id);
+    await bulkDel(store, rows.map(r => r.id));
   }
 
   // 3) 人物
@@ -72,8 +72,8 @@ export async function applyEnrichment(app, data) {
       if (names.some(name => text.includes(name))) mentions.push(character.id);
     }
     chapter.mentions = mentions;
-    await put('chapters', chapter);
   }
+  await bulkPut('chapters', chapters);
 
   // 5) 设定 / 素材 / 快捷短语
   const lore = (data.lore || []).map((l, index) => ({

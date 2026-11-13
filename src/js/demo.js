@@ -1,7 +1,7 @@
 /* Novie — 首次启动示例：《斗罗大陆1》早期剧情原创同人重述（非原文） */
 
 import { uid, countChars, plainTextToHtml, dateKey, addDays } from './utils.js';
-import { bulkPut, put } from './db.js';
+import { bulkPut, put, getAllBy } from './db.js';
 
 const PROJECT_NAME = '《斗罗大陆1》同人参考';
 const AUTHOR = '同人示例';
@@ -257,10 +257,13 @@ const EXTRA = {
   ch5: { target: 1600, tags: ['猎魂森林', '第一魂环'], plotlines: ['main'] },
   ch6: { target: 1800, tags: ['史莱克', '七怪'], plotlines: ['main', 'team'] },
   ch7: { target: 1800, tags: ['赵无极', '暗器'], plotlines: ['team', 'tangmen', 'love'] },
-  ch8: { target: 1800, tags: ['星斗森林', '八蛛矛'], plotlines: ['main', 'team', 'romance'] },
+  ch8: { target: 1800, tags: ['星斗森林', '八蛛矛'], plotlines: ['main', 'team', 'love'] },
 };
 
 export async function createDemoProject() {
+  // 幂等播种：同名示例工程已存在时直接返回，改过名的用户触发补种也不会再生成一份
+  const existing = (await getAllBy('projects', 'name', PROJECT_NAME))[0];
+  if (existing) return existing;
   const now = Date.now();
   const projectId = uid('prj');
   const project = {
@@ -291,13 +294,13 @@ export async function createDemoProject() {
 
   const chapterPlan = [
     { key: 'ch1', volumeId: vol1.id, day: -18 },
-    { key: 'ch2', volumeId: vol1.id, day: -15 },
-    { key: 'ch3', volumeId: vol1.id, day: -12 },
-    { key: 'ch4', volumeId: vol1.id, day: -9 },
-    { key: 'ch5', volumeId: vol1.id, day: -5 },
-    { key: 'ch6', volumeId: vol2.id, day: -2 },
-    { key: 'ch7', volumeId: vol2.id, day: -1 },
-    { key: 'ch8', volumeId: vol2.id, day: 0 },
+    { key: 'ch2', volumeId: vol1.id, day: -16 },
+    { key: 'ch3', volumeId: vol1.id, day: -14 },
+    { key: 'ch4', volumeId: vol1.id, day: -12 },
+    { key: 'ch5', volumeId: vol1.id, day: -8 },
+    { key: 'ch6', volumeId: vol2.id, day: -5 },
+    { key: 'ch7', volumeId: vol2.id, day: -3 },
+    { key: 'ch8', volumeId: vol2.id, day: -1 },
   ];
 
   const chapters = [];
@@ -581,17 +584,68 @@ export async function createDemoProject() {
     { projectId, trigger: ';tb', title: '同人声明', content: '（以下为原创同人重述，借用原作人物与设定，不含原文段落。）' },
   ].map(s => ({ id: uid('snip'), projectId, ...s, createdAt: now - 86400000 * 8 }));
 
-  const dailyWords = [1200, 1800, 900, 0, 2100, 1600, 1300, 700];
-  const daily = dailyWords.map((words, i) => {
-    const d = addDays(new Date(), -(dailyWords.length - 1 - i));
-    return {
-      id: `${projectId}|${dateKey(d)}`,
-      projectId,
-      date: dateKey(d),
-      words,
-      seconds: words > 0 ? Math.round((words / 850) * 3600 + 240) : 0,
-    };
+  // 示例打卡数据：整体落在过去（不含今天），并按各章真实字数对齐，
+  // 用户当天开始写作时不会叠在假数据上
+  const wordsByDay = new Map();
+  chapterPlan.forEach((plan, i) => {
+    wordsByDay.set(plan.day, (wordsByDay.get(plan.day) || 0) + chapters[i].wordCount);
   });
+  const daily = [...wordsByDay.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([day, words]) => {
+      const d = addDays(new Date(), day);
+      return {
+        id: `${projectId}|${dateKey(d)}`,
+        projectId,
+        date: dateKey(d),
+        words,
+        seconds: words > 0 ? Math.round((words / 850) * 3600 + 240) : 0,
+      };
+    });
+
+  // 示例伏笔：含预计回收章（标红演示）与未定回收章的进行中条目，
+  // 也覆盖"删章级联断开引用"的回归场景
+  const foreshadows = [
+    {
+      id: uid('fsh'), projectId,
+      title: '左手的昊天锤何时能亮出来',
+      clue: '唐昊叮嘱：在外人面前永远不要亮出锤子，也不要急着给锤子添魂环。',
+      notes: '预计在史莱克的正面危机里首次公开。',
+      plantChapterId: chapterIdByKey.ch3,
+      targetChapterId: chapterIdByKey.ch8,
+      resolved: false,
+      resolvedChapterId: null,
+      resolvedAt: null,
+      createdAt: now - 86400000 * 10,
+      updatedAt: now - 86400000 * 2,
+    },
+    {
+      id: uid('fsh'), projectId,
+      title: '小舞的魂兽血脉',
+      clue: '“武魂是兔子，很厉害的那种”——柔骨兔的来历始终没有说明。',
+      notes: '',
+      plantChapterId: chapterIdByKey.ch4,
+      targetChapterId: null,
+      resolved: false,
+      resolvedChapterId: null,
+      resolvedAt: null,
+      createdAt: now - 86400000 * 9,
+      updatedAt: now - 86400000 * 2,
+    },
+    {
+      id: uid('fsh'), projectId,
+      title: '玄天宝录的下落',
+      clue: '唐三跳崖前把佛怒唐莲还给唐门，那本偷学的《玄天宝录》是否随他一起转生？',
+      notes: '前世线收束用。',
+      plantChapterId: chapterIdByKey.ch1,
+      targetChapterId: null,
+      resolved: false,
+      resolvedChapterId: null,
+      resolvedAt: null,
+      createdAt: now - 86400000 * 11,
+      updatedAt: now - 86400000 * 3,
+    },
+  ];
 
   await put('projects', project);
   await bulkPut('volumes', volumes);
@@ -603,6 +657,7 @@ export async function createDemoProject() {
   await bulkPut('snippets', snippets);
   await bulkPut('plotlines', plotlines);
   await bulkPut('plotnodes', plotnodes);
+  await bulkPut('foreshadows', foreshadows);
   await bulkPut('daily', daily);
 
   return project;

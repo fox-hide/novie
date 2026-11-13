@@ -165,7 +165,11 @@ export function showModal({
   card.appendChild(bodyEl);
 
   const footer = el('div', { class: 'modal-footer' });
+  // 重入守卫：onClick 与 close!==false 可能各调一次 close，onClose 只能触发一次
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
     overlay.classList.remove('show');
     document.removeEventListener('keydown', onKey);
     setTimeout(() => overlay.remove(), 180);
@@ -178,11 +182,17 @@ export function showModal({
       type: 'button',
     }, action.icon ? [el('span', { class: 'btn-ico', html: icon(action.icon, 15) }), action.label] : [action.label]);
     btn.addEventListener('click', async () => {
-      if (action.onClick) {
-        const result = await action.onClick({ close, btn });
-        if (result === false) return;
+      try {
+        if (action.onClick) {
+          const result = await action.onClick({ close, btn });
+          if (result === false) return;
+        }
+        if (action.close !== false) close();
+      } catch (err) {
+        // 统一兜底：保存 handler 抛异常不再变成 unhandled rejection + 卡死
+        console.error('模态操作失败', err);
+        toast(`操作失败：${(err && err.message) || err}`, 'error', 4200);
       }
-      if (action.close !== false) close();
     });
     buttons.push(btn);
     footer.appendChild(btn);

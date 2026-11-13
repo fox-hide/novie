@@ -81,9 +81,20 @@ function httpRequest(method, url, headers = {}, bodyBuffer = null, redirects = 0
   });
 }
 
+/** 校验 IPC 调用来自应用自身的顶层主框架。 */
+function isTrustedSender(event) {
+  try {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return Boolean(win && event.senderFrame && event.senderFrame === win.webContents.mainFrame);
+  } catch {
+    return false;
+  }
+}
+
 /** 注册文件保存/打开、备份目录、WebDAV 等 IPC。 */
 function setupIpc() {
   ipcMain.handle('save-file', async (event, filename, base64, filters) => {
+    if (!isTrustedSender(event)) throw new Error('IPC 调用来源不受信任');
     const win = BrowserWindow.fromWebContents(event.sender);
     const safeName = String(filename || 'novie-export').replace(/[\\/:*?"<>|]/g, '_');
     const result = await dialog.showSaveDialog(win, {
@@ -97,6 +108,7 @@ function setupIpc() {
   });
 
   ipcMain.handle('open-file', async (event, filters) => {
+    if (!isTrustedSender(event)) throw new Error('IPC 调用来源不受信任');
     const win = BrowserWindow.fromWebContents(event.sender);
     const result = await dialog.showOpenDialog(win, {
       title: '打开文件',
@@ -118,6 +130,7 @@ function setupIpc() {
   });
 
   ipcMain.handle('pick-directory', async event => {
+    if (!isTrustedSender(event)) throw new Error('IPC 调用来源不受信任');
     const win = BrowserWindow.fromWebContents(event.sender);
     const result = await dialog.showOpenDialog(win, {
       title: '选择自动备份文件夹',
@@ -128,6 +141,7 @@ function setupIpc() {
   });
 
   ipcMain.handle('write-backup', async (event, dir, filename, base64) => {
+    if (!isTrustedSender(event)) throw new Error('IPC 调用来源不受信任');
     if (!dir || typeof dir !== 'string') throw new Error('备份目录无效');
     const safeName = String(filename || 'novie-backup.novie').replace(/[\\/:*?"<>|]/g, '_');
     await fs.promises.mkdir(dir, { recursive: true });
@@ -151,6 +165,7 @@ function setupIpc() {
   });
 
   ipcMain.handle('webdav', async (event, { method, url, headers, body }) => {
+    if (!isTrustedSender(event)) throw new Error('IPC 调用来源不受信任');
     const bodyBuffer = body ? Buffer.from(body, 'base64') : null;
     const finalHeaders = { ...(headers || {}) };
     if (bodyBuffer) finalHeaders['Content-Length'] = String(bodyBuffer.length);

@@ -108,7 +108,8 @@ export function renderExportView(app) {
   let format = 'txt';
   let rangeType = 'all';
   let volumeId = app.state.volumes[0]?.id || '';
-  const selected = new Set(app.orderedChapters().map(c => c.id));
+  // 自定义范围用"已取消勾选"语义：进入页面后新建/导入的章节默认可导出
+  const deselected = new Set();
 
   const { page, body } = makePage({
     title: '导出与备份',
@@ -186,8 +187,9 @@ export function renderExportView(app) {
   const toggleAll = makeButton('全选 / 清空', {
     small: true, ghost: true,
     onClick: () => {
-      const allChecked = app.state.chapters.every(c => selected.has(c.id));
-      app.state.chapters.forEach(c => { if (allChecked) selected.delete(c.id); else selected.add(c.id); });
+      const allChecked = app.state.chapters.every(c => !deselected.has(c.id));
+      if (allChecked) app.state.chapters.forEach(c => deselected.add(c.id));
+      else deselected.clear();
       customBox.querySelectorAll('input[type=checkbox]').forEach(cb => { cb.checked = !allChecked; });
       updateSummary();
     },
@@ -201,9 +203,9 @@ export function renderExportView(app) {
     customList.appendChild(el('div', { class: 'custom-vol-title', text: volume.title }));
     for (const chapter of chapters) {
       const cb = el('input', { type: 'checkbox' });
-      cb.checked = selected.has(chapter.id);
+      cb.checked = !deselected.has(chapter.id);
       cb.addEventListener('change', () => {
-        if (cb.checked) selected.add(chapter.id); else selected.delete(chapter.id);
+        if (cb.checked) deselected.delete(chapter.id); else deselected.add(chapter.id);
         updateSummary();
       });
       customList.appendChild(el('label', { class: 'custom-chapter' }, [
@@ -244,10 +246,15 @@ export function renderExportView(app) {
   const exportBtn = makeButton('开始导出', {
     primary: true, iconName: 'download',
     onClick: async () => {
-      const isProjectFormat = format === 'project' || format === 'encrypted';
-      const items = isProjectFormat ? [] : await getExportItems();
-      if (!isProjectFormat && !items.length) { toast('没有可导出的章节', 'warn'); return; }
-      await runExport(items, exportBtn);
+      setButtonBusy(exportBtn, true, '生成中…');
+      try {
+        const isProjectFormat = format === 'project' || format === 'encrypted';
+        const items = isProjectFormat ? [] : await getExportItems();
+        if (!isProjectFormat && !items.length) { toast('没有可导出的章节', 'warn'); return; }
+        await runExport(items, exportBtn);
+      } finally {
+        setButtonBusy(exportBtn, false);
+      }
     },
   });
   const btnRow = el('div', { class: 'export-action-row' }, [
@@ -260,7 +267,7 @@ export function renderExportView(app) {
     const ordered = app.orderedChapters();
     if (rangeType === 'all') return ordered;
     if (rangeType === 'volume') return ordered.filter(c => c.volumeId === volumeId);
-    return ordered.filter(c => selected.has(c.id));
+    return ordered.filter(c => !deselected.has(c.id));
   }
 
   async function getExportItems() {
@@ -293,6 +300,13 @@ export function renderExportView(app) {
   function updateOptions() {
     const isProject = format === 'project' || format === 'encrypted';
     rangePanel.classList.toggle('disabled-panel', isProject);
+    // zip-txt 的分章文件不带 BOM：禁用该选项，避免静默降级
+    const encSel = document.getElementById('export-encoding');
+    if (encSel) {
+      const bomOption = encSel.querySelector('option[value="utf-8-bom"]');
+      if (bomOption) bomOption.disabled = format === 'zip-txt';
+      if (format === 'zip-txt' && encSel.value === 'utf-8-bom') encSel.value = 'utf-8';
+    }
     updateSummary();
     const hint = document.getElementById('export-hint');
     if (hint) {
@@ -356,6 +370,7 @@ export function renderExportView(app) {
         printHtmlDocument(html);
         toast('已打开打印视图，请在对话框中选择“另存为 PDF”', 'info', 4200);
       } else if (format === 'zip-txt' || format === 'zip-md') {
+        // zip-txt 不支持 BOM：选项已在 UI 禁用，这里再兜底
         const { bytes, missing } = buildChapterArchive({
           items, format: format === 'zip-md' ? 'md' : 'txt', encoding: encoding === 'gbk' ? 'gbk' : 'utf-8',
         });
@@ -408,7 +423,19 @@ export function renderExportView(app) {
     el('div', { class: 'panel-title', text: '本机自动备份' }),
     makeButton('立即备份', {
       small: true, primary: true, iconName: 'save',
-      onClick: async () => { await createInternalBackup(app); paintBackups(); },
+      onClick: async e => {
+        const btn = e.currentTarget;
+        setButtonBusy(btn, true, '备份中…');
+        try {
+          await createInternalBackup(app);
+          await paintBackups();
+        } catch (err) {
+          console.error(err);
+          toast('备份失败：' + (err.message || err), 'error', 4200);
+        } finally {
+          setButtonBusy(btn, false);
+        }
+      },
     }),
   ]));
   const backupStatus = el('p', { class: 'muted small' });
@@ -417,6 +444,7 @@ export function renderExportView(app) {
   const backupList = el('div', { class: 'backup-list' });
   backupPanel.appendChild(backupList);
   const paintBackups = async () => {
+    if (!backupList.isConnected) return;
     backupList.innerHTML = '';
     const list = await listBackups(app.state.project.id);
     if (!list.length) {
@@ -618,23 +646,46 @@ export function renderSettingsView(app) {
   const data = section('数据与备份', '默认每 30 分钟在浏览器/应用中保留一份完整工程快照。');
   data.appendChild(settingRow('本机备份间隔（分钟）', (() => {
     const input = el('input', { class: 'input small-input', type: 'number', min: 10, max: 240, step: 5, value: app.settings.backupIntervalMin || 30 });
-    input.addEventListener('change', () => app.saveSettings({ backupIntervalMin: Math.max(10, Number(input.value) || 30) }));
+    input.addEventListener('change', () => app.saveSettings({
+      backupIntervalMin: Math.min(240, Math.max(10, Number(input.value) || 30)),
+    }));
     return input;
   })()));
   const dataBtns = el('div', { class: 'btn-row' });
   dataBtns.appendChild(makeButton('立即创建备份', {
     small: true, primary: true, iconName: 'save',
-    onClick: async () => { await createInternalBackup(app); toast('备份已创建', 'success'); },
+    onClick: async e => {
+      const btn = e.currentTarget;
+      setButtonBusy(btn, true, '备份中…');
+      try {
+        await createInternalBackup(app);
+        toast('备份已创建', 'success');
+      } catch (err) {
+        console.error(err);
+        toast('备份失败：' + (err.message || err), 'error', 4200);
+      } finally {
+        setButtonBusy(btn, false);
+      }
+    },
   }));
   dataBtns.appendChild(makeButton('导出工程', {
     small: true, iconName: 'download',
-    onClick: async () => {
-      const bundle = await exportProjectBundle(app.state.project.id, { includeVersions: true });
-      const { bytes } = buildProjectJson(bundle);
-      await saveBytes(bytes, `${safeFileName(app.state.project.name)}-${dateStamp()}.novie`, {
-        mime: 'application/json',
-        filters: [{ name: 'Novie 工程', extensions: ['novie'] }],
-      });
+    onClick: async e => {
+      const btn = e.currentTarget;
+      setButtonBusy(btn, true, '导出中…');
+      try {
+        const bundle = await exportProjectBundle(app.state.project.id, { includeVersions: true });
+        const { bytes } = buildProjectJson(bundle);
+        await saveBytes(bytes, `${safeFileName(app.state.project.name)}-${dateStamp()}.novie`, {
+          mime: 'application/json',
+          filters: [{ name: 'Novie 工程', extensions: ['novie'] }],
+        });
+      } catch (err) {
+        console.error(err);
+        toast('导出失败：' + (err.message || err), 'error', 4200);
+      } finally {
+        setButtonBusy(btn, false);
+      }
     },
   }));
   dataBtns.appendChild(makeButton('导入工程 / 备份', {
@@ -664,7 +715,6 @@ export function renderSettingsView(app) {
     autoCb.checked = Boolean(app.settings.autoFileBackup);
     autoCb.addEventListener('change', () => app.saveSettings({ autoFileBackup: autoCb.checked }));
     data.appendChild(settingRow('启用定时文件备份', autoCb, '需要先选择文件夹；备份间隔同上。'));
-    data.appendChild(el('p', { class: 'muted tiny', text: dirLabel.textContent }));
   } else {
     data.appendChild(el('div', { class: 'notice-box' }, [
       el('span', { class: 'notice-icon', html: icon('info', 16) }),
@@ -692,8 +742,9 @@ export function renderSettingsView(app) {
   const sync = section('WebDAV 备份（可选）', '不绑定任何网盘账号，把备份推到你自己指定的 WebDAV 目录；每次上传都是带时间戳的新文件，不会覆盖云端旧备份。');
   const wd = { ...(app.settings.webdav || {}) };
   const bindWd = (key, input) => input.addEventListener('change', async () => {
+    // 现取现合并：上传成功后 settings.webdav 的时间戳不会被本页的浅拷贝回写抹掉
+    await app.saveSettings({ webdav: { ...(app.settings.webdav || {}), [key]: input.value } });
     wd[key] = input.value;
-    await app.saveSettings({ webdav: wd });
   });
   const wdUrl = el('input', { class: 'input', value: wd.url || '', placeholder: 'https://dav.example.com/remote.php/dav/files/用户名' });
   bindWd('url', wdUrl);
@@ -707,7 +758,10 @@ export function renderSettingsView(app) {
   bindWd('filename', wdFile);
   const wdEncrypt = el('input', { type: 'checkbox' });
   wdEncrypt.checked = wd.encrypt !== false;
-  wdEncrypt.addEventListener('change', () => { wd.encrypt = wdEncrypt.checked; app.saveSettings({ webdav: wd }); });
+  wdEncrypt.addEventListener('change', () => {
+    wd.encrypt = wdEncrypt.checked;
+    app.saveSettings({ webdav: { ...(app.settings.webdav || {}), encrypt: wdEncrypt.checked } });
+  });
   const wdPwd = el('input', { class: 'input', type: 'password', value: wd.password || '', placeholder: '至少 4 位' });
   bindWd('password', wdPwd);
   const syncGrid = el('div', { class: 'form-stack' }, [
@@ -911,15 +965,24 @@ export function renderSettingsView(app) {
   security.appendChild(settingRow('打开作品时要求密码', lockOnOpen));
   const encBtn = makeButton('立即创建加密备份', {
     small: true, iconName: 'shield',
-    onClick: async () => {
+    onClick: async e => {
+      const btn = e.currentTarget;
       const pwd = await askNewPassword();
       if (pwd === null) return;
-      const bundle = await exportProjectBundle(app.state.project.id, { includeVersions: true });
-      const bytes = await encryptJson(bundle, pwd);
-      await saveBytes(bytes, `${safeFileName(app.state.project.name)}-${dateStamp()}.noviebak`, {
-        mime: 'application/octet-stream',
-        filters: [{ name: 'Novie 加密备份', extensions: ['noviebak'] }],
-      });
+      setButtonBusy(btn, true, '加密中…');
+      try {
+        const bundle = await exportProjectBundle(app.state.project.id, { includeVersions: true });
+        const bytes = await encryptJson(bundle, pwd);
+        await saveBytes(bytes, `${safeFileName(app.state.project.name)}-${dateStamp()}.noviebak`, {
+          mime: 'application/octet-stream',
+          filters: [{ name: 'Novie 加密备份', extensions: ['noviebak'] }],
+        });
+      } catch (err) {
+        console.error(err);
+        toast('加密备份失败：' + (err.message || err), 'error', 4200);
+      } finally {
+        setButtonBusy(btn, false);
+      }
     },
   });
   security.appendChild(settingRow('加密备份', encBtn, 'AES-GCM 加密后保存，适合放到网盘或 U 盘。'));
@@ -951,7 +1014,7 @@ export function renderSettingsView(app) {
     ['Ctrl + Shift + T', '打字机模式'],
     ['Ctrl + J', '一键网文排版'],
     ['Ctrl + Shift + E', '导出中心'],
-    ['Alt + 1 ~ 4', '插入快捷短语'],
+    ['Alt + 1 ~ 9', '插入快捷短语'],
     ['Alt + ← / →', '上一章 / 下一章'],
     ['F2', '重命名当前章节'],
   ].forEach(([k, v]) => table.appendChild(el('div', { class: 'shortcut-row' }, [

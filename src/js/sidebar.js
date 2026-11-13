@@ -1,6 +1,6 @@
 /* Novie — 侧边栏、章节树、项目切换 */
 
-import { $, fmtNumber, fmtWan, truncate, debounce } from './utils.js';
+import { $, fmtNumber, fmtWan, truncate, debounce, safeColor } from './utils.js';
 import {
   icon, el, contextMenu, confirmDialog, promptDialog, showModal,
   emptyState, makeButton, makeIconButton, badge
@@ -81,7 +81,7 @@ function renderProjectButton(app) {
   }
   const total = app.state.chapters.reduce((n, c) => n + (c.wordCount || 0), 0);
   const btn = el('button', { class: 'project-switch', type: 'button', title: '切换 / 管理作品' }, [
-    el('span', { class: 'project-avatar', style: { background: project.color || '#8a5a3b' }, text: projectInitial(project.name) }),
+    el('span', { class: 'project-avatar', style: { background: safeColor(project.color) }, text: projectInitial(project.name) }),
     el('span', { class: 'project-meta' }, [
       el('strong', { class: 'project-name', text: project.name || '未命名作品' }),
       el('span', { class: 'project-sub', text: `${project.author || '佚名'} · ${fmtWan(total)}字` }),
@@ -135,7 +135,7 @@ function openProjectModal(app) {
   if (!projects.length) body.appendChild(el('p', { class: 'muted', text: '还没有作品。' }));
   for (const p of projects) {
     const row = el('div', { class: `project-row ${p.id === app.state.project?.id ? 'active' : ''}`.trim() });
-    row.appendChild(el('span', { class: 'project-avatar', style: { background: p.color || '#8a5a3b' }, text: projectInitial(p.name) }));
+    row.appendChild(el('span', { class: 'project-avatar', style: { background: safeColor(p.color) }, text: projectInitial(p.name) }));
     const info = el('div', { class: 'project-row-meta' }, [
       el('strong', { text: p.name || '未命名作品' }),
       el('span', { class: 'muted small', text: `${p.author || '佚名'} · 更新于 ${new Date(p.updatedAt || Date.now()).toLocaleDateString('zh-CN')}` }),
@@ -482,14 +482,14 @@ function openVolumeMenu(app, volume, pos) {
 export function openChapterMenu(app, chapter, pos) {
   contextMenu(pos.left, (pos.bottom || pos.top || 0) + 4, [
     { label: '打开', icon: 'pen', onClick: () => app.openChapter(chapter.id) },
-    { label: '章节信息 / 摘要…', icon: 'edit', onClick: () => app.openChapterInfo(chapter.id) },
+    { label: '章节信息 / 摘要…', icon: 'edit', onClick: () => app.openChapterInfoById(chapter.id) },
     { label: '重命名…', icon: 'type', onClick: () => app.renameChapter(chapter.id) },
     { label: '复制章节', icon: 'copy', onClick: () => app.duplicateChapter(chapter.id) },
     { separator: true },
     { label: '创建历史快照', icon: 'history', onClick: () => app.snapshotChapter(chapter.id) },
     { label: '在光标处拆分为两章', icon: 'columns', onClick: () => app.splitChapterAtCaret(chapter.id) },
     { label: '与下一章合并', icon: 'layers', onClick: () => app.mergeChapterWithNext(chapter.id) },
-    { label: '导出本章 TXT', icon: 'download', onClick: () => app.exportChapterTxt(chapter.id) },
+    { label: '导出本章 TXT', icon: 'download', onClick: () => app.exportCurrentChapterTxt(chapter.id) },
     { separator: true },
     { label: '删除章节…', icon: 'trash', danger: true, onClick: () => app.deleteChapterConfirm(chapter.id) },
   ], { header: chapter.title });
@@ -514,7 +514,7 @@ export function showChapterInfo(app, chapterId) {
     const cb = el('input', { type: 'checkbox', value: line.id });
     cb.checked = (chapter.plotlineIds || []).includes(line.id);
     plotBox.appendChild(el('label', { class: 'check-item' }, [
-      cb, el('span', { class: 'color-dot', style: { background: line.color || '#b4552d' } }),
+      cb, el('span', { class: 'color-dot', style: { background: safeColor(line.color, '#b4552d') } }),
       el('span', { text: line.name }),
     ]));
   }

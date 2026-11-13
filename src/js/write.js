@@ -1,7 +1,7 @@
 /* Novie — 写作视图、顶部栏、右侧辅助栏、状态栏 */
 
 import {
-  $, $$, fmtNumber, fmtWan, escapeHtml, truncate, sanitizeHtml, fmtDate, fmtRelative, fmtClock
+  $, $$, fmtNumber, fmtWan, escapeHtml, truncate, sanitizeHtml, fmtDate, fmtRelative, fmtClock, safeColor
 } from './utils.js';
 import {
   icon, el, toast, contextMenu, makeButton, makeIconButton, emptyState,
@@ -519,7 +519,7 @@ function renderPeoplePanel(app, host, keyword = '') {
   for (const c of chars) {
     const card = el('div', { class: 'mini-person' });
     card.appendChild(el('span', {
-      class: 'mini-avatar', style: { background: c.color || '#8a5a3b' },
+      class: 'mini-avatar', style: { background: safeColor(c.color) },
       text: (c.name || '?').slice(0, 1),
     }));
     const info = el('div', { class: 'mini-person-info' });

@@ -450,16 +450,17 @@ export class Editor {
       if (beforeFirst !== first.nodeValue) changed++;
     };
 
+    // 引号开合状态全章顺序维护：跨段对话（上一段以未闭合引号收尾）不再错配
+    let quoteOpen = true;
     const fixQuotes = element => {
       if (!/[\u4e00-\u9fff]/.test(element.textContent || '')) return;
-      let open = true;
       const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
       let n;
       while ((n = walker.nextNode())) {
         if (!n.nodeValue.includes('"')) continue;
         const replaced = n.nodeValue.replace(/"/g, () => {
-          const q = open ? '“' : '”';
-          open = !open;
+          const q = quoteOpen ? '“' : '”';
+          quoteOpen = !quoteOpen;
           return q;
         });
         if (replaced !== n.nodeValue) {

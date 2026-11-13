@@ -229,6 +229,28 @@ export function avatarColor(name = '') {
   return palette[hashString(name) % palette.length];
 }
 
+const HEX_COLOR_RE = /^#[0-9a-f]{6}$/i;
+
+/**
+ * 颜色白名单校验：导入的 .novie 包可能携带任意字符串充当颜色值，
+ * 进入 style 前必须收敛为 #rrggbb（无法执行脚本，但可外链 url()）。
+ */
+export function safeColor(value, fallback = '#8a5a3b') {
+  const s = String(value || '').trim();
+  return HEX_COLOR_RE.test(s) ? s : fallback;
+}
+
+/** 纯函数：按日历日口径计算"近 n 天日均"（跳写的日子按 0 计，而不是被挤掉）。 */
+export function averageDailyWords(daily = [], days = 7, now = new Date()) {
+  const map = new Map(daily.map(d => [d.date, Number(d.words) || 0]));
+  let sum = 0;
+  for (let i = days - 1; i >= 0; i--) {
+    const d = addDays(now, -i);
+    sum += map.get(dateKey(d)) || 0;
+  }
+  return Math.round(sum / days);
+}
+
 export function safeFileName(name = '未命名', fallback = 'novie') {
   const cleaned = String(name || '')
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
@@ -348,8 +370,12 @@ export function replaceInHtml(html, search, replacement, all = true, caseSensiti
 /** 在纯文本中查找，返回带上下文的命中列表。 */
 export function findInText(text, query, limit = 60, caseSensitive = false) {
   if (!query) return [];
-  const hay = caseSensitive ? text : text.toLowerCase();
-  const needle = caseSensitive ? query : query.toLowerCase();
+  // 与 replaceInHtml 对齐：小写折叠改变字符串长度时（少数 Unicode 字符）回退精确匹配
+  const needleRaw = caseSensitive ? query : query.toLowerCase();
+  const hayRaw = caseSensitive ? text : text.toLowerCase();
+  const safeFold = needleRaw.length === query.length && hayRaw.length === text.length;
+  const needle = safeFold ? needleRaw : query;
+  const hay = safeFold ? hayRaw : text;
   const results = [];
   let idx = 0;
   while (results.length < limit) {
@@ -358,10 +384,10 @@ export function findInText(text, query, limit = 60, caseSensitive = false) {
     results.push({
       index: found,
       before: text.slice(Math.max(0, found - 24), found),
-      match: text.slice(found, found + query.length),
-      after: text.slice(found + query.length, found + query.length + 30),
+      match: text.slice(found, found + needle.length),
+      after: text.slice(found + needle.length, found + needle.length + 30),
     });
-    idx = found + Math.max(1, query.length);
+    idx = found + Math.max(1, needle.length);
   }
   return results;
 }
